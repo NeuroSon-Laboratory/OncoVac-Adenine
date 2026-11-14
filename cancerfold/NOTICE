@@ -1,0 +1,12 @@
+CancerFold (by NeuroSon)
+Copyright 2026 NeuroSon Computational Team (Yovan Fabiano Maitlen)
+
+This software integrates and extends components from AlphaFold 2
+(https://github.com/google-deepmind/alphafold), developed by Google DeepMind:
+- AlphaFold 2 source code is licensed under the Apache License, Version 2.0.
+- AlphaFold 2 model parameters are licensed under the Creative Commons
+  Attribution 4.0 International License (CC BY 4.0).
+
+CancerFold adds original JAX-native stochastic differential equation (SDE)
+sampling, SE(3)-invariant history-repulsive and stereochemical biasing
+potentials, somatic mutation analysis, and ensemble thermodynamics modules.
