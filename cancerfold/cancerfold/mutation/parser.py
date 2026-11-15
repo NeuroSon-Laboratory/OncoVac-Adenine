@@ -1,53 +1,20 @@
-"""Multi-scale somatic mutation parser with dynamic thermal equilibrium and AlphaGenome coupling."""
-import jax
+"""Somatic point-mutation parser (e.g., Y220C, T790M, V600E) and sequence validator."""
 import jax.numpy as jnp
 
 AA_ORDER = "ARNDCQEGHILKMFPSTWYV"
 AA_TO_IDX = {aa: idx for idx, aa in enumerate(AA_ORDER)}
 
 
-def parse(
-    code: str,
-    log2_fc: jnp.ndarray = jnp.array(0.0, dtype=jnp.float32),
-    delta_psi: jnp.ndarray = jnp.array(0.0, dtype=jnp.float32),
-    start_resnum: int = 1,
-) -> dict:
+def parse(code: str, start_resnum: int = 1) -> dict:
     clean = code.strip().upper()
     wt_aa = clean[0]
     mut_aa = clean[-1]
     pos_1based = int(clean[1:-1])
-
-    delta_phys = jnp.abs(AA_PHYSICS[AA_TO_IDX[mut_aa]] - AA_PHYSICS[AA_TO_IDX[wt_aa]])
-    q_drive = 1.0 + jnp.sum(delta_phys) + jnp.abs(jnp.asarray(log2_fc, dtype=jnp.float32))
-
-    t_ref = jnp.array(298.15, dtype=jnp.float32)   # IUPAC standard reference temperature (K)
-    cp_water = jnp.array(0.018, dtype=jnp.float32) # Molar heat capacity of water (kcal/(mol*K), Privalov 1979)
-    dt_span = jnp.array(12.0, dtype=jnp.float32)   # Characteristic ambient-to-physiological span (K)
-
-    def temp_loss(t_k: jnp.ndarray) -> jnp.ndarray:
-        heat_flux = q_drive * jnp.exp(-(t_k - t_ref) / dt_span)
-        heat_sink = 0.5 * cp_water * (t_k - t_ref) ** 2
-        return heat_flux + heat_sink
-
-    grad_t = jax.grad(temp_loss)
-    temp_k = jax.lax.fori_loop(0, 15, lambda _, t: t - 10.0 * grad_t(t), t_ref)
-
-    r_gas = jnp.array(0.0019872, dtype=jnp.float32)
-    kbt = r_gas * temp_k
-
-    intact_splice = jnp.clip(1.0 + jnp.asarray(delta_psi, dtype=jnp.float32), 1e-6, 1.0)
-    dosage = (2.0 ** jnp.asarray(log2_fc, dtype=jnp.float32)) * intact_splice * (t_ref / temp_k)
-    ddg_dosage = -kbt * jnp.log(jnp.clip(dosage, 1e-6, 1e6))
-
     return {
         "wt": wt_aa,
         "mut": mut_aa,
         "pos_1based": pos_1based,
         "idx_0based": pos_1based - start_resnum,
-        "temp_k": temp_k,
-        "kbt": kbt,
-        "dosage_ratio": dosage,
-        "ddg_dosage": ddg_dosage,
     }
 
 
@@ -103,7 +70,3 @@ def encode(seq: str) -> dict:
 #   - Hydropathy (exact): Kyte & Doolittle (1982), J. Mol. Biol. 157(1):105-132
 #   - Normalized steric volume [0..1]: Zamyatnin (1972), Prog. Biophys. Mol. Biol. 24:107-123; Richards (1974)
 #   - Side-chain H-bond capacity: McDonald & Thornton (1994), J. Mol. Biol. 238(5):777-793
-#   - Molar heat capacity buffering & protein thermal stability: Privalov (1979), Adv. Protein Chem. 33:167-241
-#   - Tumor microenvironment metabolic hyperthermia: Vaupel, Kallinowski & Okunieff (1989), Cancer Res. 49(23):6449-6465
-#   - AlphaGenome regulatory variant expression & splicing (PSI): Avsec et al. (2025); Katz et al. (2010), Nature Methods
-#   - Boltzmann chemical potential shift from dosage (dG = -RT ln(C_mut / C_wt)): Hill (1985), Springer
