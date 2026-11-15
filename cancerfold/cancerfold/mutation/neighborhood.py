@@ -8,6 +8,7 @@ def opt_radius(
     mut_idx: int,
     wt_phys: jnp.ndarray,
     mut_phys: jnp.ndarray,
+    tem_k: jnp.ndarray,
     steps: int = 15,
     lr: float = 0.5,
 ) -> jnp.ndarray:
@@ -20,7 +21,7 @@ def opt_radius(
 
     r_min = 8.0               # Minimum C-alpha shell cutoff (Angstrom, Kellogg et al. 2011)
     lambda_d = 3.04           # Debye electrostatic screening length (Angstrom, Honig & Nicholls 1995)
-    kbt = 0.0019872 * 310.15  # Thermal energy RT at 310.15 K / 37 C body temp (kcal/mol)
+    kbt = 0.0019872 * temp_k # Thermal energy RT at 310.15 K / 37 C body temp (kcal/mol)
     sigma_r = 1.5             # Radial shell fluctuation width (Angstrom, Bahar et al. 1997)
     k_spring = kbt / (sigma_r ** 2)
 
