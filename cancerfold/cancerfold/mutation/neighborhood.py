@@ -8,7 +8,7 @@ def opt_radius(
     mut_idx: int,
     wt_phys: jnp.ndarray,
     mut_phys: jnp.ndarray,
-    tem_k: jnp.ndarray,
+    temp_k: jnp.ndarray,
     steps: int = 15,
     lr: float = 0.5,
 ) -> jnp.ndarray:
