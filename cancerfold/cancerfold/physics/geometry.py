@@ -1,7 +1,5 @@
 """SE(3)-invariant smoothed pairwise distance operators D_ij(X) in JAX."""
-import jax
 import jax.numpy as jnp
-
 
 def pairwise_dist(
     coords: jnp.ndarray, 
