@@ -3,21 +3,34 @@ import jax
 import jax.numpy as jnp
 
 
-def pairwise_dist(coords: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+def pairwise_dist(
+    coords: jnp.ndarray, 
+    eps: float = 1e-8
+) -> jnp.ndarray:
+    
     """Computes smooth, SE(3)-invariant pairwise Euclidean distances D_ij(X) = sqrt(||x_i - x_j||^2 + eps)."""
     diff = coords[:, None, :] - coords[None, :, :]
     sq_dist = jnp.sum(diff ** 2, axis=-1)
     return jnp.sqrt(sq_dist + eps)
 
 
-def cdist_smooth(coords_a: jnp.ndarray, coords_b: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+def cdist_smooth(
+    coords_a: jnp.ndarray, 
+    coords_b: jnp.ndarray, 
+    eps: float = 1e-8
+) -> jnp.ndarray:
+    
     """Computes smooth pairwise distances D_ij(X, Y) between two 3D point sets (N, 3) and (M, 3)."""
     diff = coords_a[:, None, :] - coords_b[None, :, :]
     sq_dist = jnp.sum(diff ** 2, axis=-1)
     return jnp.sqrt(sq_dist + eps)
 
 
-def pairwise_unit_vectors(coords: jnp.ndarray, eps: float = 1e-8) -> tuple:
+def pairwise_unit_vectors(
+    coords: jnp.ndarray,
+    eps: float = 1e-8
+) -> tuple:
+    
     """Returns smoothed pairwise distances D_ij(X) and regularized unit direction vectors r_hat_ij."""
     diff = coords[:, None, :] - coords[None, :, :]
     dist = jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + eps)
@@ -31,6 +44,7 @@ def distance_matrix_rmsd(
     pair_mask: jnp.ndarray = None,
     eps: float = 1e-8,
 ) -> jnp.ndarray:
+    
     """Computes SE(3)-invariant distance RMSD (dRMSD) over upper-triangle non-adjacent residue pairs."""
     n = d_pred.shape[0]
     idx = jnp.arange(n)
