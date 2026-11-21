@@ -1,31 +1,91 @@
-"""Somatic point-mutation parser (e.g., Y220C, T790M, V600E) and sequence validator."""
+"""Somatic & SKEMPI 2.0 point-mutation parser (e.g., Y220C, YA220C) and sequence validator."""
+import re
+from typing import Dict, Optional, Tuple, Union
 import jax.numpy as jnp
 
 AA_ORDER = "ARNDCQEGHILKMFPSTWYV"
 AA_TO_IDX = {aa: idx for idx, aa in enumerate(AA_ORDER)}
 
+# Matches single-chain ("Y220C") and SKEMPI 2.0 chain/icode ("YA220C", "YA220BC", "Y-5C")
+_MUT_PATTERN = re.compile(r"^([A-Z])([A-Z])?(-?\d+)([A-Z])?([A-Z])$")
 
-def parse(code: str, start_resnum: int = 1) -> dict:
+
+def parse(
+    code: str,
+    start_resnum: int = 1,
+    res_map: Optional[Dict[Union[int, str, Tuple[Optional[str], Union[int, str]]], int]] = None,
+) -> dict:
     clean = code.strip().upper()
-    wt_aa = clean[0]
-    mut_aa = clean[-1]
-    pos_1based = int(clean[1:-1])
+    match = _MUT_PATTERN.match(clean)
+    if not match:
+        raise ValueError(f"Invalid mutation code format: '{code}'")
+
+    wt_aa, chain, pos_str, icode, mut_aa = match.groups()
+    if wt_aa not in AA_TO_IDX or mut_aa not in AA_TO_IDX:
+        raise ValueError(f"Non-canonical amino acid in mutation '{code}': wt='{wt_aa}', mut='{mut_aa}'")
+
+    pos_1based = int(pos_str)
+    icode = icode or ""
+    res_label = f"{pos_1based}{icode}"
+
+    if res_map is not None:
+        lookup_keys = [
+            (chain, res_label),
+            (chain, pos_1based),
+            res_label,
+            pos_1based,
+        ]
+        idx_0based = None
+        for key in lookup_keys:
+            if key in res_map:
+                idx_0based = res_map[key]
+                break
+        if idx_0based is None:
+            raise KeyError(f"Residue (chain={chain}, pos={res_label}) not found in PDB res_map.")
+    else:
+        idx_0based = pos_1based - start_resnum
+
     return {
         "wt": wt_aa,
         "mut": mut_aa,
+        "chain": chain,
         "pos_1based": pos_1based,
-        "idx_0based": pos_1based - start_resnum,
+        "icode": icode,
+        "idx_0based": idx_0based,
     }
 
 
-def point(wt_seq: str, code: str, start_resnum: int = 1) -> str:
-    info = parse(code, start_resnum=start_resnum)
+def point(
+    wt_seq: str,
+    code: str,
+    start_resnum: int = 1,
+    res_map: Optional[Dict[Union[int, str, Tuple[Optional[str], Union[int, str]]], int]] = None,
+) -> str:
+    info = parse(code, start_resnum=start_resnum, res_map=res_map)
     idx = info["idx_0based"]
     if idx < 0 or idx >= len(wt_seq):
-        raise ValueError(f"Position {info['pos_1based']} out of sequence bounds (length {len(wt_seq)})")
+        raise ValueError(f"Position {info['pos_1based']}{info['icode']} out of sequence bounds (length {len(wt_seq)})")
     if wt_seq[idx] != info["wt"]:
-        raise ValueError(f"Expected '{info['wt']}' at position {info['pos_1based']}, got '{wt_seq[idx]}'")
+        raise ValueError(
+            f"Expected '{info['wt']}' at position {info['pos_1based']}{info['icode']} "
+            f"(chain={info['chain']}), got '{wt_seq[idx]}'"
+        )
     return wt_seq[:idx] + info["mut"] + wt_seq[idx + 1:]
+
+
+def apply_mutations(
+    wt_seq: str,
+    codes: str,
+    start_resnum: int = 1,
+    res_map: Optional[Dict[Union[int, str, Tuple[Optional[str], Union[int, str]]], int]] = None,
+) -> str:
+    """Applies one or more comma-separated mutation codes (e.g., SKEMPI 2.0 'YA220C,RB248Q')."""
+    seq = wt_seq
+    for token in codes.split(","):
+        token = token.strip()
+        if token:
+            seq = point(seq, token, start_resnum=start_resnum, res_map=res_map)
+    return seq
 
 
 # [charge_pH7.4, hydrophobicity, relative_volume, H_bonding]
