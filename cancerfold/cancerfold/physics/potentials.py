@@ -1,158 +1,236 @@
-"""Differentiable 3D-oriented backbone/side-chain (U_geom) and pocket-targeted Metadynamics (U_rep) potentials."""
-from typing import Optional
+"""Full-state analytical effective Hamiltonian H_alpha(X) with adaptive dielectric & zero-core ENM."""
+from typing import Dict, Optional, Tuple
 import jax
 import jax.numpy as jnp
 
-from cancerfold.physics.geometry import nonbonded_pair_mask, pairwise_dist
+from cancerfold.physics.geometry import pairwise_dist
+
+EPS_CORE = 8.0       # Buried protein interior dielectric constant
+EPS_WATER = 78.4     # Bulk physiological water dielectric constant
+KAPPA_DEBYE = 0.125  # Inverse Debye screening length at 150 mM NaCl [1 / Angstrom]
+K_COULOMB = 332.0637 # Electrostatic conversion constant [kcal * Angstrom / (mol * e^2)]
+EPS_SAFE = 1e-12     # Differentiable norm epsilon
+
+
+def _safe_norm(vec: jnp.ndarray, axis: int = -1, keepdims: bool = False) -> jnp.ndarray:
+    return jnp.sqrt(jnp.sum(vec ** 2, axis=axis, keepdims=keepdims) + EPS_SAFE)
+
+
+def c2_envelope(dist: jnp.ndarray, r_cut: float) -> jnp.ndarray:
+    """C^2-smooth quintic cutoff envelope: f(0)=1, f(r_cut)=f'(r_cut)=f''(r_cut)=0."""
+    u = jnp.clip(dist / r_cut, 0.0, 1.0)
+    return 1.0 - 10.0 * (u ** 3) + 15.0 * (u ** 4) - 6.0 * (u ** 5)
 
 
 def virtual_cb(backbone: jnp.ndarray) -> jnp.ndarray:
-    """Reconstructs 3D L-amino-acid pseudo-C_beta side-chain orientation from (N, CA, C)."""
-    n_pos = backbone[:, 0, :]
-    ca_pos = backbone[:, 1, :]
-    c_pos = backbone[:, 2, :]
+    """Reconstructs chiral L-amino acid pseudo-C_beta position from rigid (N, CA, C) frame."""
+    n_pos, ca_pos, c_pos = backbone[:, 0, :], backbone[:, 1, :], backbone[:, 2, :]
     b = ca_pos - n_pos
     c = c_pos - ca_pos
     a = jnp.cross(b, c)
     return -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + ca_pos
 
 
-def u_geom_potential(
+def coordination_burial(
+    d_cb: jnp.ndarray,
+    residue_mask: jnp.ndarray,
+    r_burial: float = 10.5,
+    n0: float = 8.0,
+    dn: float = 2.5,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Live C^2-smooth coordination number n_i(X) and burial fraction b_i(X) in (0, 1).
+    Drops smoothly toward 0 (solvent-exposed) as pocket residues separate past ~10.5-11 A.
+    """
+    m = residue_mask.astype(jnp.float32)
+    off_diag = 1.0 - jnp.eye(d_cb.shape[0], dtype=jnp.float32)
+    f_burial = c2_envelope(d_cb, r_cut=r_burial) * (m[:, None] * m[None, :]) * off_diag
+    n_i = jnp.sum(f_burial, axis=-1)
+    b_i = jax.nn.sigmoid((n_i - n0) / dn) * m
+    return n_i, b_i
+
+
+def adaptive_inv_dielectric(b_i: jnp.ndarray) -> jnp.ndarray:
+    """Smooth local inverse dielectric 1/eps_eff(b_i, b_j) interpolating core <-> bulk water."""
+    inv_w = 1.0 / EPS_WATER
+    inv_c = 1.0 / EPS_CORE
+    return inv_w + (b_i[:, None] * b_i[None, :]) * (inv_c - inv_w)
+
+
+def u_peptide_bonds(
+    backbone: jnp.ndarray,
+    residue_mask: jnp.ndarray,
+    chain_mask: Optional[jnp.ndarray],
+    k_pep: float = 50.0,
+) -> jnp.ndarray:
+    """Inter-residue covalent peptide geometry (Engh-Huber: C_i-N_{i+1}, CA_i-N_{i+1}, C_i-CA_{i+1})."""
+    m = residue_mask.astype(jnp.float32)
+    adj_valid = m[:-1] * m[1:]
+    if chain_mask is not None:
+        same_chain = (chain_mask[:-1] == chain_mask[1:]).astype(jnp.float32)
+        adj_valid = adj_valid * same_chain
+
+    c_prev, ca_prev = backbone[:-1, 2, :], backbone[:-1, 1, :]
+    n_next, ca_next = backbone[1:, 0, :], backbone[1:, 1, :]
+
+    d_cn = _safe_norm(n_next - c_prev, axis=-1)
+    d_can = _safe_norm(n_next - ca_prev, axis=-1)
+    d_cca = _safe_norm(ca_next - c_prev, axis=-1)
+
+    e_pep = (
+        (d_cn - 1.329) ** 2
+        + 0.5 * (d_can - 2.425) ** 2
+        + 0.5 * (d_cca - 2.441) ** 2
+    )
+    return 0.5 * k_pep * jnp.sum(adj_valid * e_pep)
+
+
+def u_shared_scaffold(
     backbone: jnp.ndarray,
     d_ref_ca: jnp.ndarray,
-    phys_wt: jnp.ndarray,
-    phys_mut: jnp.ndarray,
     weights: jnp.ndarray,
-    theta: dict,
+    residue_mask: jnp.ndarray,
+    theta: Dict[str, float],
     chain_mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
-    n_pos = backbone[:, 0, :]
+    """
+    Shared topological scaffold U_shared(X) = U_pep + U_ENM.
+    Inside the mutation pocket core (w_i * w_j -> 1), ENM stiffness drops to 0 (enm_soften=1.0),
+    acting strictly as a far-field fulcrum without biasing pocket opening or reverse symmetry.
+    """
+    u_pep = u_peptide_bonds(backbone, residue_mask, chain_mask, k_pep=theta.get("k_pep", 50.0))
+
     ca_pos = backbone[:, 1, :]
-    c_pos = backbone[:, 2, :]
-    n = backbone.shape[0]
-
-    # 1. Covalent 3D backbone triangle & peptide bonds (Engh & Huber 1991)
-    d_n_ca = jnp.sqrt(jnp.sum((ca_pos - n_pos) ** 2, axis=-1) + 1e-8)
-    d_ca_c = jnp.sqrt(jnp.sum((c_pos - ca_pos) ** 2, axis=-1) + 1e-8)
-    d_n_c = jnp.sqrt(jnp.sum((c_pos - n_pos) ** 2, axis=-1) + 1e-8)
-    u_intra = jnp.sum((d_n_ca - 1.458) ** 2 + (d_ca_c - 1.525) ** 2 + (d_n_c - 2.459) ** 2)
-
-    cm = jnp.ones(n - 1, dtype=jnp.float32) if chain_mask is None else chain_mask
-    d_c_n = jnp.sqrt(jnp.sum((n_pos[1:] - c_pos[:-1]) ** 2, axis=-1) + 1e-8)
-    d_ca_n = jnp.sqrt(jnp.sum((n_pos[1:] - ca_pos[:-1]) ** 2, axis=-1) + 1e-8)
-    d_c_ca = jnp.sqrt(jnp.sum((ca_pos[1:] - c_pos[:-1]) ** 2, axis=-1) + 1e-8)
-    u_pep = jnp.sum(cm * ((d_c_n - 1.329) ** 2 + (d_ca_n - 2.425) ** 2 + (d_c_ca - 2.435) ** 2))
-    u_bond = 0.5 * theta["k_bond"] * (u_intra + u_pep)
-
-    # Upper-triangle non-bonded pairs (prevents double counting, preserves inter-chain breaks)
-    upper_non_adj = nonbonded_pair_mask(n, chain_mask=chain_mask)
-    pair_w = weights[:, None] * weights[None, :]
-
-    # 2. Gaussian ENM anchored to d_ref_ca, smoothly softened in pocket (Tirion 1996; Hinsen 1998)
     d_ca = pairwise_dist(ca_pos)
-    enm_contact = jnp.exp(-0.5 * (d_ref_ca / theta["r_enm"]) ** 2)
-    soften = jnp.clip(theta["soften"], 0.0, 0.95)
-    elastic_k = theta["k_elastic"] * enm_contact * (1.0 - soften * pair_w)
-    u_elastic = 0.5 * jnp.sum(upper_non_adj * elastic_k * (d_ca - d_ref_ca) ** 2)
+    m = residue_mask.astype(jnp.float32)
+    off_diag = 1.0 - jnp.eye(d_ca.shape[0], dtype=jnp.float32)
+    pair_valid = (m[:, None] * m[None, :]) * off_diag
 
-    # 3. 3D side-chain steric clash: AF2 Overlap + Monotonic Soft-Core WCA Lennard-Jones
-    cb = virtual_cb(backbone)
-    d_cb = pairwise_dist(cb)
-    vol = phys_mut[:, 2]
-    d_min = theta["d_vdw"] + theta["k_vol"] * (vol[:, None] + vol[None, :])
-    overlap = jax.nn.relu(d_min - d_cb)
-
-    d_clamped = d_min - overlap
-    soft_pad = (theta["sc_alpha"] * d_min) ** 2
-    r_soft = jnp.sqrt(d_clamped ** 2 + soft_pad)
-    r_cut = jnp.sqrt(d_min ** 2 + soft_pad)
-    wca_core = ((r_cut / r_soft) ** 6 - 1.0) ** 2
-    u_clash = jnp.sum(upper_non_adj * (0.5 * theta["k_clash"] * (overlap ** 2) + theta["eps_lj"] * wca_core))
-
-    # 4. Non-covalent perturbation (Mutant - WT) in 3D cb space: Debye-Huckel, Hydrophobic (h>0), H-bond
-    k_coulomb = 332.0637  # Universal Coulomb constant [kcal * A / (mol * e^2)]
-    lambda_d = 3.04       # Physiological Debye length at ~150 mM salt (Honig & Nicholls 1995)
-    d_elec = jnp.sqrt(d_cb ** 2 + theta["r_born"] ** 2)
-
-    dq_pair = (phys_mut[:, 0:1] * phys_mut[:, 0:1].T) - (phys_wt[:, 0:1] * phys_wt[:, 0:1].T)
-    dh_pair = (jax.nn.relu(phys_mut[:, 1:2]) * jax.nn.relu(phys_mut[:, 1:2]).T) - (
-        jax.nn.relu(phys_wt[:, 1:2]) * jax.nn.relu(phys_wt[:, 1:2]).T
-    )
-    dhb_pair = (phys_mut[:, 3:4] * phys_mut[:, 3:4].T) - (phys_wt[:, 3:4] * phys_wt[:, 3:4].T)
-
-    du_elec = (k_coulomb / theta["eps_r"]) * jnp.sum(
-        upper_non_adj * pair_w * dq_pair * jnp.exp(-d_cb / lambda_d) / d_elec
-    )
-    du_hydro = -theta["k_hydro"] * jnp.sum(
-        upper_non_adj * pair_w * dh_pair * jnp.exp(-0.5 * (d_cb / theta["r_hydro"]) ** 2)
-    )
-    du_hbond = -theta["k_hbond"] * jnp.sum(
-        upper_non_adj * pair_w * dhb_pair * jnp.exp(-0.5 * (d_cb / theta["r_hbond"]) ** 2)
-    )
-
-    return u_bond + u_elastic + u_clash + du_elec + du_hydro + du_hbond
+    soften = theta.get("enm_soften", 1.0)
+    enm_cut = c2_envelope(d_ref_ca, r_cut=theta.get("r_enm", 12.0))
+    k_ij = theta.get("k_enm", 1.0) * enm_cut * jnp.clip(1.0 - soften * (weights[:, None] * weights[None, :]), 0.0, 1.0)
+    u_enm = 0.25 * jnp.sum(pair_valid * k_ij * (d_ca - d_ref_ca) ** 2)
+    return u_pep + u_enm
 
 
-def u_rep_history(
+def u_noncov_state(
     backbone: jnp.ndarray,
+    phys_state: jnp.ndarray,
+    residue_mask: jnp.ndarray,
+    theta: Dict[str, float],
+    use_adaptive_dielectric: bool = True,
+) -> jnp.ndarray:
+    """
+    Full-state non-covalent potential U_noncov(X; phys_alpha) for exact BAR mirror symmetry.
+    phys_state columns: [0: volume_norm, 1: charge, 2: hydrophobicity, 3: hbond_donor, 4: hbond_acc].
+    """
+    m = residue_mask.astype(jnp.float32)
+    n = backbone.shape[0]
+    off_diag = 1.0 - jnp.eye(n, dtype=jnp.float32)
+    pair_valid = (m[:, None] * m[None, :]) * off_diag
+
+    cb_pos = virtual_cb(backbone)
+    d_cb = pairwise_dist(cb_pos)
+
+    vol = phys_state[:, 0]
+    q = phys_state[:, 1]
+    hydro = phys_state[:, 2]
+    donor = phys_state[:, 3]
+    acc = phys_state[:, 4]
+
+    # 1. Soft-core steric clash (symmetric per state)
+    r_vdw = theta.get("r_vdw_base", 3.2) + theta.get("r_vdw_scale", 1.2) * (vol[:, None] + vol[None, :])
+    overlap = jnp.maximum(0.0, r_vdw - d_cb)
+    u_clash = 0.5 * theta.get("k_clash", 2.0) * jnp.sum(pair_valid * (overlap ** 2))
+
+    # 2. Adaptive-dielectric Debye-Huckel electrostatics (long-range cutoff 16 A)
+    if use_adaptive_dielectric:
+        _, b_i = coordination_burial(d_cb, residue_mask)
+        inv_eps = adaptive_inv_dielectric(b_i)
+    else:
+        inv_eps = 1.0 / theta.get("eps_fixed", 20.0)
+
+    env_long = c2_envelope(d_cb, r_cut=theta.get("r_long", 16.0))
+    d_safe = jnp.sqrt(d_cb ** 2 + 1.0)
+    u_elec = 0.5 * theta.get("k_elec", 1.0) * K_COULOMB * jnp.sum(
+        pair_valid * env_long * inv_eps * (q[:, None] * q[None, :]) * jnp.exp(-KAPPA_DEBYE * d_safe) / d_safe
+    )
+
+    # 3. Short-range hydrophobic & H-bond interactions (short-range cutoff 10 A)
+    env_short = c2_envelope(d_cb, r_cut=theta.get("r_short", 10.0))
+    u_hydro = -0.5 * theta.get("k_hydro", 0.5) * jnp.sum(
+        pair_valid * env_short * (hydro[:, None] * hydro[None, :]) * jnp.exp(-0.5 * ((d_cb - 5.5) / 2.0) ** 2)
+    )
+    hb_pair = donor[:, None] * acc[None, :] + acc[:, None] * donor[None, :]
+    u_hbond = -0.5 * theta.get("k_hbond", 0.8) * jnp.sum(
+        pair_valid * env_short * hb_pair * jnp.exp(-0.5 * ((d_cb - 4.5) / 1.2) ** 2)
+    )
+
+    return u_clash + u_elec + u_hydro + u_hbond
+
+
+def u_metadynamics_bias(
+    backbone: jnp.ndarray,
+    weights: jnp.ndarray,
     history_cb_D: jnp.ndarray,
     history_mask: jnp.ndarray,
-    weights: jnp.ndarray,
-    theta: dict,
-    chain_mask: Optional[jnp.ndarray] = None,
+    theta: Dict[str, float],
 ) -> jnp.ndarray:
-    """Pocket-targeted Metadynamics memory over H lightweight history windows via jax.lax.scan."""
-    d_cb = pairwise_dist(virtual_cb(backbone))
-    n = backbone.shape[0]
-    upper_non_adj = nonbonded_pair_mask(n, chain_mask=chain_mask)
-    pair_w = upper_non_adj * (weights[:, None] * weights[None, :])
-    norm_w = jnp.maximum(jnp.sum(pair_w), 1e-8)
+    """Repulsive Gaussian hills in pocket distance space (active ONLY in Exploration Mode, k_rep > 0)."""
+    k_rep = theta.get("k_rep", 0.0)
+    cb_pos = virtual_cb(backbone)
+    d_cb = pairwise_dist(cb_pos)
+    w_pair = weights[:, None] * weights[None, :]
+    w_norm = jnp.sum(w_pair) + 1e-6
 
-    def accum_hill(total_u: jnp.ndarray, item: tuple) -> tuple:
-        d_hist, is_valid = item
-        msd_pocket = jnp.sum(pair_w * (d_cb - d_hist) ** 2) / norm_w
-        hill = theta["k_rep"] * is_valid * jnp.exp(-0.5 * msd_pocket / (theta["sigma_rep"] ** 2))
-        return total_u + hill, None
-
-    u_rep, _ = jax.lax.scan(accum_hill, jnp.array(0.0, dtype=jnp.float32), (history_cb_D, history_mask))
-    return u_rep
+    diff = d_cb[None, :, :] - history_cb_D
+    msd = jnp.sum(w_pair[None, :, :] * (diff ** 2), axis=(1, 2)) / w_norm
+    sigma_meta = theta.get("sigma_meta", 0.5)
+    hills = history_mask.astype(jnp.float32) * jnp.exp(-0.5 * msd / (sigma_meta ** 2))
+    return k_rep * jnp.sum(hills)
 
 
-def energy_and_force(
+def state_physics_energy_and_force(
     backbone: jnp.ndarray,
     d_ref_ca: jnp.ndarray,
-    phys_wt: jnp.ndarray,
-    phys_mut: jnp.ndarray,
+    phys_state: jnp.ndarray,
     weights: jnp.ndarray,
+    residue_mask: jnp.ndarray,
     history_cb_D: jnp.ndarray,
     history_mask: jnp.ndarray,
-    theta: dict,
+    theta: Dict[str, float],
     chain_mask: Optional[jnp.ndarray] = None,
-) -> tuple:
-    """Computes total physics energy and exact 3D forces F = -grad U on (N, CA, C)."""
-    def total_energy(x_bb: jnp.ndarray) -> jnp.ndarray:
-        return u_geom_potential(x_bb, d_ref_ca, phys_wt, phys_mut, weights, theta, chain_mask) + u_rep_history(
-            x_bb, history_cb_D, history_mask, weights, theta, chain_mask=chain_mask
-        )
+    use_adaptive_dielectric: bool = True,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Computes full-state analytical energy H_phys(X; alpha) and conservative forces -grad H_phys."""
+    def _u_fn(x_bb: jnp.ndarray) -> jnp.ndarray:
+        u_sh = u_shared_scaffold(x_bb, d_ref_ca, weights, residue_mask, theta, chain_mask=chain_mask)
+        u_nc = u_noncov_state(x_bb, phys_state, residue_mask, theta, use_adaptive_dielectric=use_adaptive_dielectric)
+        u_meta = u_metadynamics_bias(x_bb, weights, history_cb_D, history_mask, theta)
+        return u_sh + u_nc + u_meta
 
-    energy, grad_x = jax.value_and_grad(total_energy)(backbone)
-    return energy, -grad_x
+    u_val, grad_x = jax.value_and_grad(_u_fn)(backbone)
+    return u_val, -grad_x
 
 
 # References:
-#   - Standard peptide covalent bond lengths & intra-residue N-CA-C geometry:
-#     Engh & Huber (1991), Acta Crystallogr. A 47:392-400
-#   - Tetrahedral pseudo-C_beta reconstruction & epsilon-regularized Euclidean distance:
-#     Jumper et al. (2021), Nature 596:583-589 (AlphaFold 2, Supplementary Information)
-#   - Elastic Network Model & Gaussian contact decay:
-#     Tirion (1996), Phys. Rev. Lett. 77(9):1905-1908; Hinsen (1998), Proteins 33(3):417-429
-#   - Repulsive Weeks-Chandler-Andersen potential & Soft-Core regularization:
-#     Weeks, Chandler & Andersen (1971), J. Chem. Phys. 54(12):5237-5247
-#     Beutler et al. (1994), Chem. Phys. Lett. 222(6):529-539
-#   - Screened Debye-Huckel electrostatics & short-range Born regularization:
-#     Honig & Nicholls (1995), Science 268(5214):1144-1149; Still et al. (1990), JACS 112(16):6127-6129
-#   - Hydrophobic core attraction (h > 0) & side-chain H-bonding:
-#     Kauzmann (1959), Adv. Protein Chem. 14:1-63; Kyte & Doolittle (1982), J. Mol. Biol. 157(1):105-132
-#     McDonald & Thornton (1994), J. Mol. Biol. 238(5):777-793
-#   - History-dependent repulsive Metadynamics potential (U_rep):
-#     Laio & Parrinello (2002), PNAS 99(20):12562-12566
+#   - Standard covalent peptide bond geometry (C-N, CA-N, C-CA):
+#     Engh & Huber (1991), Acta Cryst. A 47(4):392-400.
+#   - Chiral L-amino acid tetrahedral pseudo-C_beta reconstruction:
+#     Jumper et al. (2021), Nature 596:583-589 (AlphaFold 2 Supplementary Info).
+#   - Elastic Network Model (ENM) far-field topological scaffold:
+#     Tirion (1996), Phys. Rev. Lett. 77(9):1905-1908;
+#     Atilgan et al. (2001), Biophys. J. 80(1):505-515.
+#   - C^2-smooth quintic radial cutoff envelope for conservative MD forces:
+#     Gasteiger, Groß & Günnemann (2020), ICLR (DimeNet).
+#   - Smooth coordination number & solvent burial exposure proxy:
+#     Miyazawa & Jernigan (1985), Macromolecules 18(3):534-552;
+#     Hamelryck (2005), Proteins 59(1):38-48.
+#   - Debye-Huckel screening & effective protein interior vs. bulk water dielectric:
+#     Debye & Huckel (1923), Phys. Z. 24:185-206;
+#     Schutz & Warshel (2001), Proteins 44(4):400-417;
+#     Warshel et al. (2006), Biochim. Biophys. Acta 1764(11):1647-1676.
+#   - History-dependent repulsive Gaussian hills (Metadynamics, Exploration Mode only):
+#     Laio & Parrinello (2002), PNAS 99(20):12562-12566.
+#   - Exact thermodynamic antisymmetry requirement in ddG predictors:
+#     Pucci et al. (2018), Briefings in Bioinformatics 19(4):599-611.
