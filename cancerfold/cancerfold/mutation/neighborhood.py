@@ -1,56 +1,53 @@
-"""Continuous 3D mutation neighborhood attenuation from local packing density."""
+"""Smooth SE(3)-invariant multi-mutation pocket attenuation via Noisy-OR composition."""
 from typing import Optional
 import jax.numpy as jnp
 
+from cancerfold.physics.geometry import pairwise_dist
 
-def pocket_mask_from_point(
-    coords: jnp.ndarray,
-    anchor_xyz: jnp.ndarray,
+
+def multi_pocket_mask(
+    ca_coords: jnp.ndarray,
+    mut_mask: jnp.ndarray,
     residue_mask: Optional[jnp.ndarray] = None,
-    include_self: bool = False,
-) -> dict:
-    """Computes Gaussian spatial coupling weights w(d) around a 3D anchor point using K=12 shell."""
-    diff = coords - anchor_xyz
-    dist = jnp.sqrt(jnp.sum(diff ** 2, axis=-1) + 1e-8)
-    k_target = 12 if include_self else 11
+    sigma: float = 8.0,
+) -> jnp.ndarray:
+    """
+    Computes C^inf-smooth pocket weights w_i in [0, 1] for arbitrary single or multi-mutations:
+        w_i = 1 - prod_k (1 - m_k * exp(-0.5 * (d_ik / sigma)^2))
 
-    if residue_mask is None:
-        k_shell = jnp.minimum(k_target, jnp.maximum(dist.shape[0] - 1, 0))
-        r_c = jnp.maximum(jnp.sort(dist)[k_shell], 1e-6)
-        weights = jnp.exp(-0.5 * (dist / r_c) ** 2)
+    Args:
+        ca_coords: (N, 3) C-alpha coordinates [Angstrom].
+        mut_mask: (N,) binary mask (1.0 at mutated residues, 0.0 elsewhere).
+        residue_mask: Optional (N,) valid-residue mask for static MAX_N padding.
+        sigma: Spatial attenuation width [Angstrom].
+    """
+    d_ca = pairwise_dist(ca_coords)
+    m_mut = mut_mask.astype(jnp.float32)
+    if residue_mask is not None:
+        m_res = residue_mask.astype(jnp.float32)
+        m_mut = m_mut * m_res
     else:
-        m = residue_mask.astype(jnp.float32)
-        n_valid = jnp.sum(m)
-        k_shell = jnp.minimum(k_target, jnp.maximum(n_valid - 1, 0)).astype(jnp.int32)
-        masked_dist = jnp.where(m > 0.5, dist, 1e9)
-        r_c = jnp.maximum(jnp.sort(masked_dist)[k_shell], 1e-6)
-        weights = jnp.exp(-0.5 * (dist / r_c) ** 2) * m
+        m_res = jnp.ones_like(m_mut)
 
-    return {
-        "r_c": r_c,
-        "weights": weights,
-    }
+    g_ik = jnp.exp(-0.5 * (d_ca / sigma) ** 2)
+    one_minus = jnp.clip(1.0 - (m_mut[None, :] * g_ik), 0.0, 1.0)
+    w_total = (1.0 - jnp.prod(one_minus, axis=-1)) * m_res
+    return w_total
 
 
 def pocket_mask(
-    coords: jnp.ndarray,
+    ca_coords: jnp.ndarray,
     mut_idx: int,
     residue_mask: Optional[jnp.ndarray] = None,
-) -> dict:
-    """Computes Gaussian spatial coupling weights w(d) centered on residue mut_idx (K=12 neighbors)."""
-    return pocket_mask_from_point(
-        coords=coords,
-        anchor_xyz=coords[mut_idx],
-        residue_mask=residue_mask,
-        include_self=True,
-    )
+    sigma: float = 8.0,
+) -> jnp.ndarray:
+    """Backward-compatible wrapper for single-point mutations (identical to multi_pocket_mask)."""
+    mut_mask = jnp.zeros((ca_coords.shape[0],), dtype=jnp.float32).at[mut_idx].set(1.0)
+    return multi_pocket_mask(ca_coords, mut_mask, residue_mask=residue_mask, sigma=sigma)
 
 
 # References:
-#   - First 3D coordination shell & local packing density in proteins (K = 12 close-packed neighbors):
-#     Richards (1974), J. Mol. Biol. 82(1):1-14
-#     Halle (2002), PNAS 99(3):1274-1279
-#   - Continuous Gaussian distance attenuation in elastic protein networks:
-#     Bahar, Atilgan & Erman (1997), Folding & Design 2(3):173-181
-#   - Epsilon-regularized Euclidean norm sqrt(||dx||^2 + eps) for smooth JAX autodiff:
-#     Jumper et al. (2021), Nature 596:583-589 (AlphaFold 2, Supplementary Information)
+#   - Noisy-OR bounded causal aggregation in [0, 1]:
+#     Pearl (1988), Probabilistic Reasoning in Intelligent Systems, Morgan Kaufmann.
+#   - Multi-mutation epistasis & SKEMPI 2.0 complex-level benchmark:
+#     Jankauskaite et al. (2019), Bioinformatics 35(3):462-469.
