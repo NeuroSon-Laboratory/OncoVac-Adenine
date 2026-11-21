@@ -1,4 +1,5 @@
 """SE(3)-invariant smoothed pairwise distance and backbone centering operators in JAX."""
+from typing import Optional
 import jax.numpy as jnp
 
 
@@ -44,20 +45,34 @@ def pairwise_unit_vectors(
     return dist, unit_vec
 
 
-def center(coords: jnp.ndarray) -> jnp.ndarray:
+def center(
+    coords: jnp.ndarray,
+    mask: Optional[jnp.ndarray] = None,
+    eps: float = 1e-8,
+) -> jnp.ndarray:
     """Centers (N, 3) coordinates or (N, 3, 3) [N, CA, C] backbone so C-alpha center of mass sits at [0, 0, 0]."""
     if coords.ndim == 2 and coords.shape[-1] == 3:
-        com = jnp.mean(coords, axis=0, keepdims=True)
-        return coords - com
+        if mask is None:
+            com = jnp.mean(coords, axis=0, keepdims=True)
+            return coords - com
+        m = mask.astype(jnp.float32)[:, None]
+        com = jnp.sum(coords * m, axis=0, keepdims=True) / jnp.maximum(jnp.sum(m), eps)
+        return (coords - com) * m
+
     if coords.ndim == 3 and coords.shape[1:] == (3, 3):
-        ca_com = jnp.mean(coords[:, 1, :], axis=0, keepdims=True)
-        return coords - ca_com[:, None, :]
+        if mask is None:
+            ca_com = jnp.mean(coords[:, 1, :], axis=0, keepdims=True)
+            return coords - ca_com[:, None, :]
+        m = mask.astype(jnp.float32)
+        ca_com = jnp.sum(coords[:, 1, :] * m[:, None], axis=0, keepdims=True) / jnp.maximum(jnp.sum(m), eps)
+        return (coords - ca_com[:, None, :]) * m[:, None, None]
+
     raise ValueError(f"Expected (N, 3) or (N, 3, 3) coordinates, got {coords.shape}")
 
 
 def nonbonded_pair_mask(
     n: int,
-    chain_mask: jnp.ndarray = None,
+    chain_mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Returns upper-triangle non-bonded pair mask (N, N), preserving inter-chain breaks where chain_mask == 0."""
     idx = jnp.arange(n)
@@ -71,8 +86,8 @@ def nonbonded_pair_mask(
 def distance_matrix_rmsd(
     d_pred: jnp.ndarray,
     d_ref: jnp.ndarray,
-    pair_mask: jnp.ndarray = None,
-    chain_mask: jnp.ndarray = None,
+    pair_mask: Optional[jnp.ndarray] = None,
+    chain_mask: Optional[jnp.ndarray] = None,
     eps: float = 1e-8,
 ) -> jnp.ndarray:
     """Computes SE(3)-invariant distance RMSD (dRMSD) over upper-triangle non-bonded residue pairs."""
