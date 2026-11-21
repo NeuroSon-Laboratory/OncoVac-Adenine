@@ -1,12 +1,19 @@
 """AlphaGenome regulatory variant coupling via Boltzmann chemical potential."""
+from typing import Union
 import jax.numpy as jnp
+
+ScalarOrArray = Union[float, jnp.ndarray]
 
 
 def coupled_dosage(
-    log2_fc: jnp.ndarray,
-    temp_k: jnp.ndarray,
-    delta_psi: jnp.ndarray = jnp.array(0.0, dtype=jnp.float32),
+    log2_fc: ScalarOrArray,
+    temp_k: ScalarOrArray,
+    delta_psi: ScalarOrArray = 0.0,
 ) -> dict:
+    log2_fc = jnp.asarray(log2_fc, dtype=jnp.float32)
+    temp_k = jnp.asarray(temp_k, dtype=jnp.float32)
+    delta_psi = jnp.asarray(delta_psi, dtype=jnp.float32)
+
     r_gas = jnp.array(0.0019872, dtype=jnp.float32)  # Universal gas constant R (kcal / (mol * K))
     kbt = r_gas * temp_k                             # Thermal energy R * T (kcal / mol)
 
