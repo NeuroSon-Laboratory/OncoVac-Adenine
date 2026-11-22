@@ -1,11 +1,11 @@
-"""Overdamped Langevin SDE integrator with Equilibrium & Metadynamics modes via jax.lax.scan and jax.vmap."""
+"""BAOAB Underdamped Langevin SDE integrator with Equilibrium & Well-Tempered Metadynamics modes."""
 from typing import Dict, Optional, Tuple
 import jax
 import jax.numpy as jnp
 
 from cancerfold.af2_core.stochastic_folding import full_state_energy_and_force
 from cancerfold.physics.geometry import center, pairwise_dist
-from cancerfold.physics.potentials import virtual_cb
+from cancerfold.physics.potentials import u_metadynamics_bias, virtual_cb
 
 R_GAS = 0.0019872      # Universal gas constant [kcal / (mol * K)]
 TEMP_PHYS = 310.15     # Physiological temperature [K] (k_B * T = 0.6163 kcal/mol)
@@ -17,7 +17,7 @@ def clip_forces(
     residue_mask: jnp.ndarray,
     max_force: float = 50.0,
 ) -> jnp.ndarray:
-    """Norm-preserving per-atom force clipping masked to active residues."""
+    """Norm-preserving per-atom force clipping masked to active residues (burn-in relaxation only)."""
     m = residue_mask.astype(jnp.float32)[:, None, None]
     f_masked = forces * m
     norms = jnp.sqrt(jnp.sum(f_masked ** 2, axis=-1, keepdims=True) + EPS_FORCE)
@@ -25,8 +25,10 @@ def clip_forces(
     return f_masked * scale
 
 
-def langevin_step(
+def baoab_step(
     backbone: jnp.ndarray,
+    velocities: jnp.ndarray,
+    forces_curr: jnp.ndarray,
     prng_key: jax.Array,
     d_ref_ca: jnp.ndarray,
     phys_state: jnp.ndarray,
@@ -39,19 +41,48 @@ def langevin_step(
     pair: Optional[jnp.ndarray] = None,
     nn_params: Optional[Dict[str, jnp.ndarray]] = None,
     chain_mask: Optional[jnp.ndarray] = None,
-    dt: float = 0.002,
-    gamma: float = 1.0,
+    dt: float = 0.02,
+    gamma: float = 2.0,
+    mass: float = 1.0,
     temp_k: float = TEMP_PHYS,
+    apply_clip: jnp.ndarray = jnp.asarray(False),
     max_force: float = 50.0,
     use_adaptive_dielectric: bool = True,
-) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
-    Single Euler-Maruyama overdamped Langevin (Brownian dynamics) step:
-        X_{t+dt} = X_t + (dt / gamma) * F(X_t) + sqrt(2 * k_B * T * dt / gamma) * xi_t
-    Re-centers active backbone coordinates to prevent global float32 COM drift.
+    Single BAOAB Underdamped Langevin step (Leimkuhler & Matthews 2013):
+      B: v <- v + (dt / 2m) * F(x)
+      A: x <- x + (dt / 2) * v
+      O: v <- c1 * v + c2 * xi          (exact Ornstein-Uhlenbeck thermostat at temp_k)
+      A: x <- center(x + (dt / 2) * v)
+      B: v <- v + (dt / 2m) * F(x_new)  (single force evaluation per step)
+    Yields exact harmonic configurational variance k_B*T/k (zero temperature inflation).
     """
-    u_tot, f_raw, u_parts = full_state_energy_and_force(
-        backbone=backbone,
+    m = residue_mask.astype(jnp.float32)[:, None, None]
+    f_eff_curr = jax.lax.cond(
+        apply_clip,
+        lambda f: clip_forces(f, residue_mask, max_force=max_force),
+        lambda f: f * m,
+        forces_curr,
+    )
+
+    # B (half kick) -> A (half drift)
+    v_half = (velocities + 0.5 * (dt / mass) * f_eff_curr) * m
+    x_half = (backbone + 0.5 * dt * v_half) * m
+
+    # O (exact Ornstein-Uhlenbeck velocity thermostat)
+    kbt = R_GAS * temp_k
+    c1 = jnp.exp(-gamma * dt)
+    c2 = jnp.sqrt((kbt / mass) * jnp.maximum(1.0 - c1 ** 2, 0.0))
+    xi = jax.random.normal(prng_key, backbone.shape, dtype=jnp.float32) * m
+    v_therm = (c1 * v_half + c2 * xi) * m
+
+    # A (half drift) + global COM suppression
+    x_next = center((x_half + 0.5 * dt * v_therm) * m, mask=residue_mask)
+
+    # Evaluate conservative Hamiltonian & force once at x_next
+    u_next, f_next_raw, u_parts = full_state_energy_and_force(
+        backbone=x_next,
         d_ref_ca=d_ref_ca,
         phys_state=phys_state,
         weights=weights,
@@ -66,23 +97,27 @@ def langevin_step(
         use_adaptive_dielectric=use_adaptive_dielectric,
     )
 
-    m = residue_mask.astype(jnp.float32)[:, None, None]
-    f_clip = clip_forces(f_raw, residue_mask, max_force=max_force)
+    f_eff_next = jax.lax.cond(
+        apply_clip,
+        lambda f: clip_forces(f, residue_mask, max_force=max_force),
+        lambda f: f * m,
+        f_next_raw,
+    )
 
-    kbt = R_GAS * temp_k
-    noise_std = jnp.sqrt(2.0 * kbt * dt / gamma)
-    xi = jax.random.normal(prng_key, backbone.shape, dtype=jnp.float32) * m
+    # B (half kick)
+    v_next = (v_therm + 0.5 * (dt / mass) * f_eff_next) * m
 
-    x_next = backbone + (dt / gamma) * f_clip + noise_std * xi
-    x_next = center(x_next, mask=residue_mask)
+    f_max = jnp.max(jnp.sqrt(jnp.sum((f_next_raw * m) ** 2, axis=-1) + EPS_FORCE))
+    n_dof = jnp.maximum(9.0 * jnp.sum(residue_mask.astype(jnp.float32)) - 3.0, 1.0)
+    t_kin = (mass * jnp.sum(v_next ** 2)) / (n_dof * R_GAS)
 
-    f_max = jnp.max(jnp.sqrt(jnp.sum((f_raw * m) ** 2, axis=-1) + EPS_FORCE))
     diag = {
         "u_phys": u_parts["u_phys"],
         "u_nn": u_parts["u_nn"],
         "f_max": f_max,
+        "t_kin": t_kin,
     }
-    return x_next, u_tot, diag
+    return x_next, v_next, f_next_raw, u_next, diag
 
 
 def run_sde_trajectory(
@@ -100,43 +135,70 @@ def run_sde_trajectory(
     num_steps: int = 200,
     burn_in: int = 40,
     stride: int = 10,
-    dt: float = 0.002,
-    gamma: float = 1.0,
+    dt: float = 0.02,
+    gamma: float = 2.0,
+    mass: float = 1.0,
     temp_k: float = TEMP_PHYS,
     temp_start: Optional[float] = None,
     max_force: float = 50.0,
-    max_hills: int = 16,
+    max_hills: int = 64,
     deposit_every: int = 20,
+    wt_bias_factor: float = 6.0,
     use_adaptive_dielectric: bool = True,
 ) -> Dict[str, jnp.ndarray]:
     """
-    Runs a static-shape Langevin SDE trajectory via jax.lax.scan.
-      - Equilibrium Mode (theta['k_rep'] == 0.0): exact Boltzmann sampling for BAR / SKEMPI 2.0.
-      - Exploration Mode (theta['k_rep'] > 0.0): deposits pocket Gaussian hills into a static
-        ring buffer every `deposit_every` steps to sample cryptic-pocket opening.
+    Runs a static-shape BAOAB Langevin trajectory via jax.lax.scan.
+      - Equilibrium Mode (theta['k_rep'] == 0.0): exact Boltzmann sampling for BAR / SKEMPI 2.0
+        with force clipping disabled after burn_in to preserve detailed balance.
+      - Exploration Mode (theta['k_rep'] > 0.0): Well-Tempered Metadynamics (Barducci et al. 2008)
+        depositing smoothly decaying Gaussian hills without overwriting prior hills.
     """
     max_n = backbone_init.shape[0]
     use_meta = float(theta.get("k_rep", 0.0)) > 0.0
     t_start = float(temp_k) if temp_start is None else float(temp_start)
+    kbt_target = R_GAS * float(temp_k)
+    kbt_delta = jnp.maximum((wt_bias_factor - 1.0) * kbt_target, 1e-6)
+
+    k_vel, k_scan = jax.random.split(prng_key)
+    m = residue_mask.astype(jnp.float32)[:, None, None]
 
     init_bb = center(backbone_init, mask=residue_mask)
+    init_vel = jax.random.normal(k_vel, init_bb.shape, dtype=jnp.float32) * jnp.sqrt(R_GAS * t_start / mass) * m
     init_hist_D = jnp.zeros((max_hills, max_n, max_n), dtype=jnp.float32)
     init_hist_m = jnp.zeros((max_hills,), dtype=jnp.float32)
     init_hill_idx = jnp.array(0, dtype=jnp.int32)
 
-    step_keys = jax.random.split(prng_key, num_steps)
+    _, init_f_raw, _ = full_state_energy_and_force(
+        backbone=init_bb,
+        d_ref_ca=d_ref_ca,
+        phys_state=phys_state,
+        weights=weights,
+        residue_mask=residue_mask,
+        history_cb_D=init_hist_D,
+        history_mask=init_hist_m,
+        theta=theta,
+        single=single,
+        pair=pair,
+        nn_params=nn_params,
+        chain_mask=chain_mask,
+        use_adaptive_dielectric=use_adaptive_dielectric,
+    )
+
+    step_keys = jax.random.split(k_scan, num_steps)
     step_indices = jnp.arange(num_steps, dtype=jnp.int32)
 
     def _scan_body(carry, inputs):
-        x_curr, hist_D, hist_m, hill_idx = carry
+        x_curr, v_curr, f_curr, hist_D, hist_m, hill_idx = carry
         step_idx, step_key = inputs
 
-        # Optional linear temperature annealing during burn-in; constant temp_k afterward
+        in_burn_in = step_idx < burn_in
         frac = jnp.minimum(1.0, step_idx.astype(jnp.float32) / jnp.maximum(1.0, float(burn_in)))
         t_curr = t_start + frac * (float(temp_k) - t_start)
 
-        x_next, u_tot, diag = langevin_step(
+        x_next, v_next, f_next, u_next, diag = baoab_step(
             backbone=x_curr,
+            velocities=v_curr,
+            forces_curr=f_curr,
             prng_key=step_key,
             d_ref_ca=d_ref_ca,
             phys_state=phys_state,
@@ -151,17 +213,21 @@ def run_sde_trajectory(
             chain_mask=chain_mask,
             dt=dt,
             gamma=gamma,
+            mass=mass,
             temp_k=t_curr,
+            apply_clip=in_burn_in,
             max_force=max_force,
             use_adaptive_dielectric=use_adaptive_dielectric,
         )
 
+        # Well-Tempered Metadynamics hill deposition (never overwrites old hills)
         def _deposit(state):
             h_D, h_m, h_i = state
+            v_bias_curr = u_metadynamics_bias(x_next, weights, h_D, h_m, theta)
+            wt_weight = jnp.exp(-v_bias_curr / kbt_delta)
             d_cb = pairwise_dist(virtual_cb(x_next))
-            slot = h_i % max_hills
-            h_D = h_D.at[slot].set(d_cb)
-            h_m = h_m.at[slot].set(1.0)
+            h_D = h_D.at[h_i].set(d_cb)
+            h_m = h_m.at[h_i].set(wt_weight)
             return h_D, h_m, h_i + 1
 
         def _no_deposit(state):
@@ -170,31 +236,31 @@ def run_sde_trajectory(
         should_deposit = (
             jnp.asarray(use_meta)
             & (step_idx >= burn_in)
+            & (hill_idx < max_hills)
             & (((step_idx - burn_in) % deposit_every) == 0)
         )
         hist_D, hist_m, hill_idx = jax.lax.cond(
             should_deposit, _deposit, _no_deposit, (hist_D, hist_m, hill_idx)
         )
 
-        return (x_next, hist_D, hist_m, hill_idx), (x_next, u_tot, diag["f_max"])
+        return (x_next, v_next, f_next, hist_D, hist_m, hill_idx), (x_next, u_next, diag["f_max"], diag["t_kin"])
 
-    (final_bb, final_hist_D, final_hist_m, _), (all_bb, all_u, all_fmax) = jax.lax.scan(
+    (final_bb, _, _, final_hist_D, final_hist_m, num_hills), (all_bb, all_u, all_fmax, all_tkin) = jax.lax.scan(
         _scan_body,
-        (init_bb, init_hist_D, init_hist_m, init_hill_idx),
+        (init_bb, init_vel, init_f_raw, init_hist_D, init_hist_m, init_hill_idx),
         (step_indices, step_keys),
     )
 
-    traj = all_bb[burn_in::stride]
-    energies = all_u[burn_in::stride]
-    f_max_trace = all_fmax[burn_in::stride]
-
     return {
-        "trajectory": traj,
-        "energies": energies,
-        "f_max": f_max_trace,
+        "trajectory": all_bb[burn_in::stride],
+        "energies": all_u[burn_in::stride],
+        "f_max": all_fmax[burn_in::stride],
+        "t_kin": all_tkin[burn_in::stride],
         "final_backbone": final_bb,
         "history_cb_D": final_hist_D,
         "history_mask": final_hist_m,
+        "num_hills": num_hills,
+        "is_equilibrium": jnp.asarray(not use_meta),
     }
 
 
@@ -214,16 +280,18 @@ def sample_ensemble(
     num_steps: int = 200,
     burn_in: int = 40,
     stride: int = 20,
-    dt: float = 0.002,
-    gamma: float = 1.0,
+    dt: float = 0.02,
+    gamma: float = 2.0,
+    mass: float = 1.0,
     temp_k: float = TEMP_PHYS,
     max_force: float = 50.0,
-    max_hills: int = 16,
+    max_hills: int = 64,
     deposit_every: int = 20,
+    wt_bias_factor: float = 6.0,
     use_adaptive_dielectric: bool = True,
 ) -> Dict[str, jnp.ndarray]:
     """
-    Runs `num_replicas` independent Langevin walkers in parallel via jax.vmap and
+    Runs `num_replicas` independent BAOAB Langevin walkers in parallel via jax.vmap and
     flattens post-burn-in snapshots into an (M, MAX_N, 3, 3) ensemble for BAR.
     """
     rep_keys = jax.random.split(prng_key, num_replicas)
@@ -246,32 +314,34 @@ def sample_ensemble(
             stride=stride,
             dt=dt,
             gamma=gamma,
+            mass=mass,
             temp_k=temp_k,
             max_force=max_force,
             max_hills=max_hills,
             deposit_every=deposit_every,
+            wt_bias_factor=wt_bias_factor,
             use_adaptive_dielectric=use_adaptive_dielectric,
         )
 
     out = jax.vmap(_run_one)(rep_keys)
     traj = out["trajectory"]    # (num_replicas, K, MAX_N, 3, 3)
     energies = out["energies"]  # (num_replicas, K)
-    flat_traj = traj.reshape((-1,) + traj.shape[2:])
-    flat_energies = energies.reshape((-1,))
 
     return {
-        "ensemble": flat_traj,
-        "energies": flat_energies,
+        "ensemble": traj.reshape((-1,) + traj.shape[2:]),
+        "energies": energies.reshape((-1,)),
         "trajectories_by_replica": traj,
-        "max_force": jnp.max(out["f_max"]),
+        "max_force_prod": jnp.max(out["f_max"]),
+        "mean_t_kin": jnp.mean(out["t_kin"]),
+        "history_weights": out["history_mask"],
+        "is_equilibrium": jnp.all(out["is_equilibrium"]),
     }
 
 
 # References:
-#   - Overdamped Langevin / Brownian dynamics & Euler-Maruyama discretization:
-#     Ermak & McCammon (1978), J. Chem. Phys. 69(4):1352-1360;
-#     Kloeden & Platen (1992), Numerical Solution of Stochastic Differential Equations, Springer.
-#   - History-dependent Gaussian hill deposition (Metadynamics, Exploration Mode):
-#     Laio & Parrinello (2002), PNAS 99(20):12562-12566.
+#   - BAOAB symmetric Langevin splitting (exact harmonic configurational sampling):
+#     Leimkuhler & Matthews (2013), Appl. Math. Res. Express 2013(1):34-56.
+#   - Well-Tempered Metadynamics (smoothly converging cryptic-pocket exploration):
+#     Barducci, Bussi & Parrinello (2008), Phys. Rev. Lett. 100(2):020603.
 #   - Parallel replica sampling for equilibrium free-energy estimation:
 #     Shirts & Chodera (2008), J. Chem. Phys. 129(12):124105.
