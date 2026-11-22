@@ -88,7 +88,7 @@ def apply_mutations(
     return seq
 
 
-# [charge_pH7.4, hydrophobicity, relative_volume, H_bonding]
+# 4-column table for trunk.py: [charge_pH7.4, hydrophobicity_KD, relative_volume, H_bonding]
 AA_PHYSICS = jnp.array([
     [ 0.0,  1.8, 0.31, 0.0],  # A
     [ 1.0, -4.5, 0.85, 1.0],  # R
@@ -113,6 +113,32 @@ AA_PHYSICS = jnp.array([
 ], dtype=jnp.float32)
 
 
+# 5-column full-state table for potentials.py:
+# [volume_norm, charge_pH7.4, hydrophobicity_norm, hbond_donor, hbond_acc]
+AA_PHYS_STATE = jnp.array([
+    [0.31,  0.0,  1.8 / 4.5, 0.0, 0.0],  # A
+    [0.85,  1.0, -4.5 / 4.5, 1.0, 0.0],  # R
+    [0.51,  0.0, -3.5 / 4.5, 1.0, 1.0],  # N
+    [0.49, -1.0, -3.5 / 4.5, 0.0, 1.0],  # D
+    [0.44,  0.0,  2.5 / 4.5, 0.5, 0.5],  # C
+    [0.63,  0.0, -3.5 / 4.5, 1.0, 1.0],  # Q
+    [0.61, -1.0, -3.5 / 4.5, 0.0, 1.0],  # E
+    [0.00,  0.0, -0.4 / 4.5, 0.0, 0.0],  # G
+    [0.68,  0.5, -3.2 / 4.5, 1.0, 1.0],  # H
+    [0.73,  0.0,  4.5 / 4.5, 0.0, 0.0],  # I
+    [0.73,  0.0,  3.8 / 4.5, 0.0, 0.0],  # L
+    [0.74,  1.0, -3.9 / 4.5, 1.0, 0.0],  # K
+    [0.71,  0.0,  1.9 / 4.5, 0.0, 0.0],  # M
+    [0.83,  0.0,  2.8 / 4.5, 0.0, 0.0],  # F
+    [0.49,  0.0, -1.6 / 4.5, 0.0, 0.0],  # P
+    [0.33,  0.0, -0.8 / 4.5, 1.0, 1.0],  # S
+    [0.48,  0.0, -0.7 / 4.5, 1.0, 1.0],  # T
+    [1.00,  0.0, -0.9 / 4.5, 1.0, 0.0],  # W
+    [0.86,  0.0, -1.3 / 4.5, 1.0, 1.0],  # Y
+    [0.59,  0.0,  4.2 / 4.5, 0.0, 0.0],  # V
+], dtype=jnp.float32)
+
+
 def encode(seq: str) -> dict:
     clean = seq.strip().upper()
     for aa in clean:
@@ -122,6 +148,7 @@ def encode(seq: str) -> dict:
     return {
         "idx": idx,
         "phys": AA_PHYSICS[idx],
+        "phys_state": AA_PHYS_STATE[idx],
     }
 
 
@@ -129,4 +156,4 @@ def encode(seq: str) -> dict:
 #   - Charge (pH 7.4): Nelson & Cox, Lehninger Principles of Biochemistry (His=+0.5 partial protonation)
 #   - Hydropathy (exact): Kyte & Doolittle (1982), J. Mol. Biol. 157(1):105-132
 #   - Normalized steric volume [0..1]: Zamyatnin (1972), Prog. Biophys. Mol. Biol. 24:107-123; Richards (1974)
-#   - Side-chain H-bond capacity: McDonald & Thornton (1994), J. Mol. Biol. 238(5):777-793
+#   - Side-chain H-bond donor/acceptor capacity: McDonald & Thornton (1994), J. Mol. Biol. 238(5):777-793
