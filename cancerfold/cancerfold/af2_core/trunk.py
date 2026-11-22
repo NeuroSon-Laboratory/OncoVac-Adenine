@@ -11,7 +11,7 @@ NUM_PHYS_FEATS = 4   # [charge, hydrophobicity, volume, hbond] from parser.py
 NUM_PHYS_PAIR = 5    # [elec, hydro, hbond, steric, enm_contact]
 R_GAS = 0.0019872    # Universal gas constant [kcal / (mol * K)]
 K_COULOMB = 332.0637 # Universal Coulomb constant [kcal * A / (mol * e^2)]
-LAMBDA_D = 3.04      # Physiological Debye length at ~150 mM salt (Honig & Nicholls 1995)
+LAMBDA_D = 8.0       # Physiological Debye length at ~150 mM NaCl (1 / 0.125 A^-1, matches potentials.py)
 BLOCK_K = 2          # Smallest non-Abelian real matrix algebra gl(2, R)
 EPS_DIST = 1e-8      # Regularization against NaN gradients
 EPS_NORM = 1e-5      # LayerNorm numerical stability
@@ -85,15 +85,26 @@ def physics_pair_kernels(
     vol = phys[:, 2]
     hb = phys[:, 3:4]
 
-    # 1-4. Side-chain interactions in 3D C_beta* space (dimensionless beta * U_ij)
-    d_elec = jnp.sqrt(d_cb ** 2 + theta["r_born"] ** 2)
-    phi_elec = beta * (K_COULOMB / theta["eps_r"]) * (q * q.T) * jnp.exp(-d_cb / LAMBDA_D) / d_elec
-    phi_hydro = -beta * theta["k_hydro"] * (h * h.T) * jnp.exp(-0.5 * (d_cb / theta["r_hydro"]) ** 2)
-    phi_hbond = -beta * theta["k_hbond"] * (hb * hb.T) * jnp.exp(-0.5 * (d_cb / theta["r_hbond"]) ** 2)
+    r_born = theta.get("r_born", 1.0)
+    eps_r = theta.get("eps_r", 20.0)
+    k_hydro = theta.get("k_hydro", 0.5)
+    r_hydro = theta.get("r_hydro", 5.5)
+    k_hbond = theta.get("k_hbond", 0.8)
+    r_hbond = theta.get("r_hbond", 4.5)
+    d_vdw = theta.get("d_vdw", theta.get("r_vdw_base", 3.2))
+    k_vol = theta.get("k_vol", theta.get("r_vdw_scale", 1.2))
+    k_clash = theta.get("k_clash", 2.0)
+    r_enm = theta.get("r_enm", 12.0)
 
-    d_min = theta["d_vdw"] + theta["k_vol"] * (vol[:, None] + vol[None, :])
+    # 1-4. Side-chain interactions in 3D C_beta* space (dimensionless beta * U_ij)
+    d_elec = jnp.sqrt(d_cb ** 2 + r_born ** 2)
+    phi_elec = beta * (K_COULOMB / eps_r) * (q * q.T) * jnp.exp(-d_cb / LAMBDA_D) / d_elec
+    phi_hydro = -beta * k_hydro * (h * h.T) * jnp.exp(-0.5 * (d_cb / r_hydro) ** 2)
+    phi_hbond = -beta * k_hbond * (hb * hb.T) * jnp.exp(-0.5 * (d_cb / r_hbond) ** 2)
+
+    d_min = d_vdw + k_vol * (vol[:, None] + vol[None, :])
     overlap = jax.nn.relu(d_min - d_cb)
-    phi_steric = beta * 0.5 * theta["k_clash"] * (overlap ** 2)
+    phi_steric = beta * 0.5 * k_clash * (overlap ** 2)
 
     # Smooth sign-preserving compression (linear for |beta*U| << 1, log-like for steric spikes)
     phi_elec = jnp.arcsinh(phi_elec)
@@ -102,7 +113,7 @@ def physics_pair_kernels(
     phi_steric = jnp.arcsinh(phi_steric)
 
     # 5. Backbone ENM contact kernel in C_alpha space (already dimensionless in [0, 1])
-    phi_enm = jnp.exp(-0.5 * (d_ca / theta["r_enm"]) ** 2)
+    phi_enm = jnp.exp(-0.5 * (d_ca / r_enm) ** 2)
 
     kernels = jnp.stack([phi_elec, phi_hydro, phi_hbond, phi_steric, phi_enm], axis=-1)
     return kernels * full_nb_mask[..., None]
@@ -260,7 +271,7 @@ def maybe_refresh_trunk(
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Verlet-style adaptive refresh: recomputes trunk only if pocket dRMSD exceeds theta['r_trunk_tol']."""
     drmsd = pocket_drift_drmsd(backbone_curr, d_cb_anchor, weights, chain_mask=chain_mask)
-    should_refresh = drmsd > theta["r_trunk_tol"]
+    should_refresh = drmsd > theta.get("r_trunk_tol", 0.75)
 
     def _recompute(_):
         s_new, p_new, m_new = run_trunk(
@@ -290,7 +301,7 @@ def maybe_refresh_trunk(
 # References:
 #   - Evoformer single/pair representations & 64-bin [2-22 A] distogram:
 #     Jumper et al. (2021), Nature 596:583-589
-#   - Screened Debye-Huckel electrostatics & Born regularization:
+#   - Screened Debye-Huckel electrostatics (~8.0 A at 150 mM NaCl) & Born regularization:
 #     Honig & Nicholls (1995), Science 268(5214):1144-1149; Still et al. (1990), JACS 112(16):6127-6129
 #   - Hydrophobic core (h > 0), side-chain H-bonding & Gaussian ENM contacts:
 #     Kyte & Doolittle (1982), J. Mol. Biol. 157(1):105-132; McDonald & Thornton (1994), J. Mol. Biol. 238(5):777-793
