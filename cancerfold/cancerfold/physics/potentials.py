@@ -7,7 +7,7 @@ from cancerfold.physics.geometry import pairwise_dist
 
 EPS_CORE = 8.0       # Buried protein interior dielectric constant
 EPS_WATER = 78.4     # Bulk physiological water dielectric constant
-KAPPA_DEBYE = 0.125  # Inverse Debye screening length at 150 mM NaCl [1 / Angstrom]
+KAPPA_DEBYE = 0.125  # Inverse Debye screening length at 150 mM NaCl (~8.0 A) [1 / Angstrom]
 K_COULOMB = 332.0637 # Electrostatic conversion constant [kcal * Angstrom / (mol * e^2)]
 EPS_SAFE = 1e-12     # Differentiable norm epsilon
 
@@ -63,11 +63,28 @@ def u_peptide_bonds(
     chain_mask: Optional[jnp.ndarray],
     k_pep: float = 50.0,
 ) -> jnp.ndarray:
-    """Inter-residue covalent peptide geometry (Engh-Huber: C_i-N_{i+1}, CA_i-N_{i+1}, C_i-CA_{i+1})."""
+    """
+    Full 6-bond Engh & Huber (1991) covalent backbone geometry:
+      - Intra-residue: N_i-CA_i (1.458 A), CA_i-C_i (1.525 A), N_i-C_i (2.462 A)
+      - Inter-residue: C_i-N_{i+1} (1.329 A), CA_i-N_{i+1} (2.425 A), C_i-CA_{i+1} (2.441 A)
+    """
     m = residue_mask.astype(jnp.float32)
+
+    # 1. Intra-residue bonds (keeps every (N, CA, C) frame & chiral CB rigid during SDE)
+    n_pos, ca_pos, c_pos = backbone[:, 0, :], backbone[:, 1, :], backbone[:, 2, :]
+    d_nca = _safe_norm(ca_pos - n_pos, axis=-1)
+    d_cac = _safe_norm(c_pos - ca_pos, axis=-1)
+    d_nc = _safe_norm(c_pos - n_pos, axis=-1)
+    e_intra = (
+        (d_nca - 1.458) ** 2
+        + (d_cac - 1.525) ** 2
+        + 0.5 * (d_nc - 2.462) ** 2
+    )
+
+    # 2. Inter-residue peptide bonds (masked across chain breaks)
     adj_valid = m[:-1] * m[1:]
     if chain_mask is not None:
-        same_chain = (chain_mask[:-1] == chain_mask[1:]).astype(jnp.float32)
+        same_chain = ((chain_mask[:-1] == chain_mask[1:]) & (chain_mask[:-1] >= 0)).astype(jnp.float32)
         adj_valid = adj_valid * same_chain
 
     c_prev, ca_prev = backbone[:-1, 2, :], backbone[:-1, 1, :]
@@ -77,12 +94,12 @@ def u_peptide_bonds(
     d_can = _safe_norm(n_next - ca_prev, axis=-1)
     d_cca = _safe_norm(ca_next - c_prev, axis=-1)
 
-    e_pep = (
+    e_inter = (
         (d_cn - 1.329) ** 2
         + 0.5 * (d_can - 2.425) ** 2
         + 0.5 * (d_cca - 2.441) ** 2
     )
-    return 0.5 * k_pep * jnp.sum(adj_valid * e_pep)
+    return 0.5 * k_pep * (jnp.sum(m * e_intra) + jnp.sum(adj_valid * e_inter))
 
 
 def u_shared_scaffold(
@@ -118,30 +135,50 @@ def u_noncov_state(
     phys_state: jnp.ndarray,
     residue_mask: jnp.ndarray,
     theta: Dict[str, float],
+    chain_mask: Optional[jnp.ndarray] = None,
     use_adaptive_dielectric: bool = True,
 ) -> jnp.ndarray:
     """
     Full-state non-covalent potential U_noncov(X; phys_alpha) for exact BAR mirror symmetry.
-    phys_state columns: [0: volume_norm, 1: charge, 2: hydrophobicity, 3: hbond_donor, 4: hbond_acc].
+    Excludes self pairs and same-chain 1-2 covalent neighbors.
+    Accepts either:
+      - 5-column phys_state: [0: volume_norm, 1: charge, 2: hydrophobicity, 3: hbond_donor, 4: hbond_acc]
+      - 4-column parser.py phys: [0: charge, 1: hydrophobicity_KD, 2: volume_norm, 3: hbond]
     """
     m = residue_mask.astype(jnp.float32)
     n = backbone.shape[0]
     off_diag = 1.0 - jnp.eye(n, dtype=jnp.float32)
-    pair_valid = (m[:, None] * m[None, :]) * off_diag
+
+    # Exclude same-chain covalent 1-2 neighbors (i, i+1) from non-bonded side-chain terms
+    if chain_mask is not None:
+        same_chain = ((chain_mask[:-1] == chain_mask[1:]) & (chain_mask[:-1] >= 0)).astype(jnp.float32) * (m[:-1] * m[1:])
+    else:
+        same_chain = m[:-1] * m[1:]
+    adj_cov = jnp.diag(same_chain, k=1) + jnp.diag(same_chain, k=-1)
+    pair_valid = (m[:, None] * m[None, :]) * off_diag * (1.0 - adj_cov)
 
     cb_pos = virtual_cb(backbone)
     d_cb = pairwise_dist(cb_pos)
 
-    vol = phys_state[:, 0]
-    q = phys_state[:, 1]
-    hydro = phys_state[:, 2]
-    donor = phys_state[:, 3]
-    acc = phys_state[:, 4]
+    if phys_state.shape[-1] == 5:
+        vol = phys_state[:, 0]
+        q = phys_state[:, 1]
+        hydro = phys_state[:, 2]
+        donor = phys_state[:, 3]
+        acc = phys_state[:, 4]
+    elif phys_state.shape[-1] == 4:
+        q = phys_state[:, 0]
+        hydro = phys_state[:, 1] / 4.5
+        vol = phys_state[:, 2]
+        donor = phys_state[:, 3]
+        acc = phys_state[:, 3]
+    else:
+        raise ValueError(f"phys_state must have 4 or 5 feature columns, got shape {phys_state.shape}.")
 
-    # 1. Soft-core steric clash (symmetric per state)
+    # 1. Soft-core steric clash (factor 0.25 = 0.5 harmonic * 0.5 symmetric double-count correction)
     r_vdw = theta.get("r_vdw_base", 3.2) + theta.get("r_vdw_scale", 1.2) * (vol[:, None] + vol[None, :])
     overlap = jnp.maximum(0.0, r_vdw - d_cb)
-    u_clash = 0.5 * theta.get("k_clash", 2.0) * jnp.sum(pair_valid * (overlap ** 2))
+    u_clash = 0.25 * theta.get("k_clash", 2.0) * jnp.sum(pair_valid * (overlap ** 2))
 
     # 2. Adaptive-dielectric Debye-Huckel electrostatics (long-range cutoff 16 A)
     if use_adaptive_dielectric:
@@ -156,10 +193,11 @@ def u_noncov_state(
         pair_valid * env_long * inv_eps * (q[:, None] * q[None, :]) * jnp.exp(-KAPPA_DEBYE * d_safe) / d_safe
     )
 
-    # 3. Short-range hydrophobic & H-bond interactions (short-range cutoff 10 A)
+    # 3. Short-range hydrophobic (strictly h > 0 via ReLU) & H-bond interactions (cutoff 10 A)
     env_short = c2_envelope(d_cb, r_cut=theta.get("r_short", 10.0))
+    h_pos = jax.nn.relu(hydro)
     u_hydro = -0.5 * theta.get("k_hydro", 0.5) * jnp.sum(
-        pair_valid * env_short * (hydro[:, None] * hydro[None, :]) * jnp.exp(-0.5 * ((d_cb - 5.5) / 2.0) ** 2)
+        pair_valid * env_short * (h_pos[:, None] * h_pos[None, :]) * jnp.exp(-0.5 * ((d_cb - 5.5) / 2.0) ** 2)
     )
     hb_pair = donor[:, None] * acc[None, :] + acc[:, None] * donor[None, :]
     u_hbond = -0.5 * theta.get("k_hbond", 0.8) * jnp.sum(
@@ -205,7 +243,10 @@ def state_physics_energy_and_force(
     """Computes full-state analytical energy H_phys(X; alpha) and conservative forces -grad H_phys."""
     def _u_fn(x_bb: jnp.ndarray) -> jnp.ndarray:
         u_sh = u_shared_scaffold(x_bb, d_ref_ca, weights, residue_mask, theta, chain_mask=chain_mask)
-        u_nc = u_noncov_state(x_bb, phys_state, residue_mask, theta, use_adaptive_dielectric=use_adaptive_dielectric)
+        u_nc = u_noncov_state(
+            x_bb, phys_state, residue_mask, theta,
+            chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
+        )
         u_meta = u_metadynamics_bias(x_bb, weights, history_cb_D, history_mask, theta)
         return u_sh + u_nc + u_meta
 
@@ -214,7 +255,7 @@ def state_physics_energy_and_force(
 
 
 # References:
-#   - Standard covalent peptide bond geometry (C-N, CA-N, C-CA):
+#   - Standard 6-bond covalent backbone & peptide geometry:
 #     Engh & Huber (1991), Acta Cryst. A 47(4):392-400.
 #   - Chiral L-amino acid tetrahedral pseudo-C_beta reconstruction:
 #     Jumper et al. (2021), Nature 596:583-589 (AlphaFold 2 Supplementary Info).
