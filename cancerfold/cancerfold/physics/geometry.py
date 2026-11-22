@@ -74,12 +74,25 @@ def nonbonded_pair_mask(
     n: int,
     chain_mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
-    """Returns upper-triangle non-bonded pair mask (N, N), preserving inter-chain breaks where chain_mask == 0."""
+    """
+    Returns upper-triangle non-bonded pair mask (N, N), excluding same-chain 1-2 covalent links.
+    Supports either:
+      - (N,) int32 chain-ID array from loader.py (e.g. [0, 0, ..., 1, 1, -1])
+      - (N-1,) binary adjacent-link mask (1 = covalent link, 0 = chain break)
+    """
     idx = jnp.arange(n)
     if chain_mask is None:
         return (idx[None, :] - idx[:, None] > 1).astype(jnp.float32)
+
     upper = (idx[None, :] - idx[:, None] > 0).astype(jnp.float32)
-    covalent_adj = jnp.diag(chain_mask.astype(jnp.float32), k=1)
+    if chain_mask.shape[0] == n:
+        same_chain = ((chain_mask[:-1] == chain_mask[1:]) & (chain_mask[:-1] >= 0)).astype(jnp.float32)
+    elif chain_mask.shape[0] == n - 1:
+        same_chain = chain_mask.astype(jnp.float32)
+    else:
+        raise ValueError(f"chain_mask must have length {n} or {n - 1}, got {chain_mask.shape[0]}.")
+
+    covalent_adj = jnp.diag(same_chain, k=1)
     return upper * (1.0 - covalent_adj)
 
 
