@@ -1,86 +1,85 @@
-# CancerFold (by NeuroSon)
+# OncoVac Adenine (Gen 1)
 
-**Stochastic Physics-Guided Extension of AlphaFold for Modeling Somatic Cancer Mutation Ensembles in JAX**
+**Physics-Coupled Molecular AI for Somatic Oncology Mutation Thermodynamics in Pure Differentiable JAX**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Built with JAX](https://img.shields.io/badge/Built%20with-JAX-orange.svg)](https://github.com/jax-ml/jax)
-[![Status: Active Research](https://img.shields.io/badge/Status-v0.1%20Architecture-yellow.svg)](#roadmap)
+[![Status: Active Research](https://img.shields.io/badge/Status-Gen%201%20Active%20Training-yellow.svg)](#benchmark-status)
+[![Website](https://img.shields.io/badge/Lab-nucleobaselabs.com-2B5A43.svg)](https://nucleobaselabs.com)
 
 ---
 
-## Why CancerFold?
+## Overview
 
-Standard AlphaFold pipelines excel at predicting static equilibrium folds driven by Multiple Sequence Alignments (MSAs). However, single somatic point mutations in cancer often become "invisible" to static predictions because one amino acid substitution is overwhelmed by evolutionary conservation in the MSA—causing wild-type and mutant predictions to collapse onto nearly identical rigid structures.
+Static structure predictors excel at wild-type equilibrium folds, yet living proteins are dynamic thermodynamic machines. A single somatic point mutation in a patient's tumor can subtly perturb side-chain packing, open cryptic binding pockets, shift conformational ensembles over time, and alter binding free energy ($\Delta\Delta G$)—signals that static single-snapshot predictions frequently miss.
 
-**CancerFold** addresses this blind spot by directly integrating a **JAX-native Stochastic Differential Equation (SDE) and physics-guided sampling engine** into the AlphaFold 2 structural prediction pipeline:
-- **AlphaFold 2 Core (*Structural Prior*):** Supplies evolutionary and stereochemical folding context (`StructureModule` / `FoldIteration`).
-- **NeuroSon Physics Engine (*Stochastic Exploration*):** Augments coordinate updates with an $SE(3)$-invariant history-repulsive bias ($U_{\text{rep}}$), local stereochemical constraints ($U_{\text{geom}}$), and annealed thermal noise ($\sigma(t)\,dW_t$) compiled end-to-end via `jax.lax.scan` and `jax.vmap`.
-
-Instead of returning a single rigid snapshot, CancerFold generates **conformational ensembles** to quantify mutation-induced pocket opening, steric gatekeeper clashes, local flexibility shifts ($\Delta\text{RMSF}$), and effective thermodynamic stability shifts ($\Delta\Delta G_{\text{eff}}$).
+**OncoVac Adenine** (originally initiated as *CancerFold*) is the flagship physics-coupled molecular AI architecture from **Nucleobase Labs** (Malang, Indonesia). Implemented end-to-end in pure differentiable **JAX**, it unites first-principles 3D statistical mechanics, open **Joltz-1** (Boltz-1 JAX port) biomolecular priors, **AlphaGenome** 1D regulatory dosage signals, and exact **Bennett Acceptance Ratio (BAR)** free-energy estimation in $\text{kcal mol}^{-1}$.
 
 ---
 
-## Architecture Overview
+## Architecture — Four Coupled Layers
 
 ```text
-Input (WT Sequence + Somatic Mutation + Optional Ligand SMILES)
+Input (WT / Mutant Complex .pdb + Target Mutation + Optional Small-Molecule Ligand)
    │
    ▼
-Evolutionary Trunk (Lightweight MSA & Pair Representations)
+Layer 01 │ 3D Backbone Frames (N, Cα, C), Chiral Cβ* Geometry & Adaptive Debye–Hückel (ε = 8 ↔ 78.4)
    │
    ▼
-Integrated AF2 + Neural SDE Core (JAX: StructureModule + U_rep + U_geom + σ(t)dW_t)
+Layer 02 │ Frozen Joltz-1 Pairformer Priors (token_s=384, token_z=128) + Conservative SE(3) U_NN(X)
    │
    ▼
-Thermodynamics & Drug-Pocket Analyzer (ΔRMSF, Pocket Geometry, Ensemble Ligand Scoring, ΔΔG_eff)
+Layer 03 │ Overdamped Langevin SDE at 310 K (jax.vmap / jax.lax.scan) + Metadynamics + Exact BAR
    │
    ▼
-Outputs: Multi-Model Ensembles (.pdb), Energy Landscape Plots, & Lab-Benchmark Metrics
+Layer 04 │ Bound–Unbound ΔΔG Cycles, Cryptic-Pocket Analytics (RMSF, P_open), & Ligand Ranking
 ```
 
----
-
-## Target Validation Scope
-
-CancerFold is designed to capture conformational and thermodynamic shifts across four mutation archetypes where static predictions fall short, evaluated directly against published experimental data ($\Delta\Delta G_{\text{exp}}$, mutant PDB/NMR structures, and cellular $\text{IC}_{50}$ shifts):
-
-1. **Cavity & Cryptic Pocket Mutations** (e.g., *TP53* Y220C)
-2. **Gatekeeper / Steric Hindrance Mutations** (e.g., *EGFR* T790M)
-3. **Allosteric / Conformational Switch Mutations** (e.g., *BRAF* V600E)
-4. **Thermodynamic Folding Destabilization & Neutral Controls** (positive vs. benign mutation separation)
-
-> *Note: Validation plots and ablation tables comparing Standard AF2 vs. Stochastic Noise vs. Full CancerFold against experimental lab measurements will be populated upon completion of Milestone `v0.3.0`.*
+1. **Layer 01 — Analytical 3D Physics & Adaptive Electrostatics:** Oriented `(N, Cα, C)` backbone frames, chiral `Cβ*` side-chain geometry, and coordination-burial adaptive Debye–Hückel electrostatics (`ε = 8 ↔ 78.4`).
+2. **Layer 02 — Frozen Joltz-1 Prior & SE(3) Neural Potential:** Stop-gradient **Joltz-1** Pairformer representations (`token_s = 384`, `token_z = 128`) coupled with a conservative, $SE(3)$-invariant neural residual potential $U_{\text{NN}}(X)$ yielding exact forces $F = -\nabla H$.
+3. **Layer 03 — Langevin SDE, Metadynamics & Exact BAR:** Parallel stochastic conformational sampling at `310 K` (`jax.vmap`, `jax.lax.scan`) with optional pocket-targeted Metadynamics and differentiable **Bennett Acceptance Ratio (BAR)** free-energy estimation enforcing exact $\text{WT} \leftrightarrow \text{Mut}$ thermodynamic antisymmetry.
+4. **Layer 04 — Oncology Target & Drug-Selection Scope:** End-to-end bound–unbound thermodynamic cycles for mutation affinity shifts and small-molecule stabilizer ranking across oncogenic targets (`p53 Y220C`, `KRAS`, `EGFR`).
 
 ---
 
-## Planned Interface (CLI & Python API)
+## Preliminary Verification (Mini-SKEMPI 2.0 Proof-of-Concept)
 
-```bash
-# Example planned workflow (Target: v0.2.0+)
-cancerfold predict \
-  --sequence target_protein.fasta \
-  --mutation "Y220C" \
-  --num-samples 200 \
-  --output results/tp53_y220c/
-```
+Before running the full 3-fold homology/complex-disjoint SKEMPI 2.0 suite, we verified end-to-end differentiability, zero-leakage splitting, and exact BAR antisymmetry on a **Mini-SKEMPI 2.0** subset (7 PDB complexes, 42 validated mutations; complex-disjoint split: 5 train PDBs [30 muts] vs. 2 unseen val PDBs [`1CBW`, `1CHO`, 12 muts]) on a single GPU (`JAX 0.11.1`):
+
+| Stage | Val Pearson `r` | Val Spearman `ρ` | Val RMSE (`kcal/mol`) | Val MAE (`kcal/mol`) |
+|---|---:|---:|---:|---:|
+| Zero-Shot `H_phys` only | `-0.639` | `-0.042` | `3.864` | `1.952` |
+| **Differentiable BAR (`H_phys + U_NN`, Best Val / Ep 01)** | **`+0.867`** | **`+0.902`** | **`1.600`** | **`1.199`** |
+| Differentiable BAR (Ep 10, unregularized) | `+0.618` | `+0.916` | `2.928` | `2.465` |
+
+* **Unseen-Complex Exact BAR Antisymmetry Audit:** $\max|\Delta\Delta G_{\text{fwd}} + \Delta\Delta G_{\text{rev}}| = 4.77 \times 10^{-7}$ (`float32` machine precision).
+* **Scope Note:** These numbers represent an early 42-mutation proof-of-concept (where several complexes share protease–inhibitor fold homology) and show expected magnitude overfitting by Epoch 10 on 30 training mutations. Full publication benchmarks will be reported only after completing zero-leakage **3-fold homology/complex-disjoint SKEMPI 2.0 CV** with best-checkpoint selection and regularization.
 
 ---
 
-## Roadmap
+## Benchmark Status
 
-- [ ] **`v0.1.0` — Physics & Geometry Core:** $SE(3)$-invariant $D_{ij}(X)$, differentiable $U_{\text{rep}}$ & $U_{\text{geom}}$, Euler–Maruyama SDE (`jax.lax.scan` + `jax.vmap`), and toy double-well ablation tests.
-- [ ] **`v0.2.0` — Integrated AF2 Engine:** Direct embedding into AlphaFold 2 `StructureModule` / `FoldIteration` with parallel ensemble generation.
-- [ ] **`v0.3.0` — Lab Benchmark Validation & Colab Demo:** Quantitative comparison against experimental $\Delta\Delta G$, PDB conformational shifts, $\text{IC}_{50}$ benchmarks, and 1-click Google Colab notebook.
+| Benchmark | Protocol & Metrics | Status |
+|---|---|---|
+| **Mini-SKEMPI 2.0 PoC** | Complex-disjoint sanity check (42 muts) & exact BAR antisymmetry (`4.77e-07`) | **Completed (PoC)** |
+| **Full SKEMPI 2.0** | 3-fold homology/complex-disjoint CV · Overall & Per-Complex `r`, `ρ`, `RMSE`, exact BAR bias | **Active Training** |
+| **p53 Y220C Cryptic Pocket** | Dynamic pocket opening at `310 K` vs. crystal structures (`PDB 2J1X / 2VUK`) | **Queued** |
+| **Targeted Oncology Drug Panel** | Joltz-1 + BAR affinity ranking vs. experimental `Kd`, `IC50`, and `ΔTm` | **Queued** |
+| **Ablation & Efficiency** | Component attribution (`H_phys`, adaptive `ε`, frozen Joltz-1 prior) & single-GPU JAX runtime | **Queued** |
 
 ---
 
 ## Attribution & License
 
-- **CancerFold** code is released under the **Apache License 2.0** for open, non-commercial scientific research and collaboration.
-- This project integrates and builds upon **AlphaFold 2** by Google DeepMind (code under **Apache 2.0**, model parameters under **CC BY 4.0**). See [`NOTICE`](NOTICE) for full attribution details.
+- **OncoVac Adenine** source code is released under the **Apache License 2.0** for open scientific research.
+- Built upon open **Joltz-1** (MIT Boltz-1 JAX port), **AlphaGenome**, and **JAX** research frameworks. See [`NOTICE`](NOTICE) for attribution details.
+- **Nucleobase Labs** is an independent computational biophysics laboratory and is not affiliated with or endorsed by Google DeepMind.
 
 ---
 
 ## Maintainers
 
-Developed by **Yovan F. Maitlen, Joachim Fidelis, Celine A. Rosali** & the **NeuroSon Computational Team**.
+Developed at **[Nucleobase Labs](https://nucleobaselabs.com)** (Malang, Indonesia) by:
+- **Yovan F. Maitlen** — Founder, Chief AI/Physics Architect & Neural Structure Lead
+- **Joachim Fidelis** — Stochastic Dynamics & Simulation Infrastructure Lead
+- **Celine A. Rosali** — Thermodynamics, Pocket Analytics & Validation Lead
