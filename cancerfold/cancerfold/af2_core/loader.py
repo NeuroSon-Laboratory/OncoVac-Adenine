@@ -1,6 +1,5 @@
-"""AlphaFold 2 parameter loader and model configuration helpers."""
 """PDB structure loader, static MAX_N padder, and multi-frame 3D trajectory exporter."""
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import jax.numpy as jnp
 
@@ -29,7 +28,8 @@ def load_pdb_backbone(
     chains: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     """
-    Parses a PDB file and extracts complete (N, CA, C) backbone frames.
+    Parses a PDB file and extracts complete (N, CA, C) backbone frames,
+    preserving PDB insertion codes (e.g., 100A, 100B in SKEMPI 2.0 antibodies).
 
     Returns:
       - backbone: (N, 3, 3) float32 array of [N, CA, C] coordinates [Angstrom]
@@ -37,10 +37,10 @@ def load_pdb_backbone(
       - chain_ids: List[str] of chain identifiers
       - chain_mask: (N,) int32 array mapping each chain to a unique integer ID
       - res_ids: List[Tuple[str, int]] of (chain_id, residue_number)
-      - res_map: Dict[Tuple[str, int], int] mapping (chain_id, resseq) -> 0-based index
+      - res_map: Dict[Tuple[str, Union[int, str]], int] mapping (chain_id, res_label/resseq) -> 0-based index
     """
-    residues: Dict[Tuple[str, int], Dict[str, object]] = {}
-    order: List[Tuple[str, int]] = []
+    residues: Dict[Tuple[str, int, str], Dict[str, object]] = {}
+    order: List[Tuple[str, int, str]] = []
 
     with open(pdb_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -62,7 +62,8 @@ def load_pdb_backbone(
                 continue
 
             resseq = int(line[22:26].strip())
-            key = (chain_id, resseq)
+            icode = line[26].strip()
+            key = (chain_id, resseq, icode)
             if key not in residues:
                 residues[key] = {"aa": AA3_TO_1[resname], "atoms": {}}
                 order.append(key)
@@ -76,7 +77,7 @@ def load_pdb_backbone(
     seq_chars: List[str] = []
     chain_ids: List[str] = []
     res_ids: List[Tuple[str, int]] = []
-    res_map: Dict[Tuple[str, int], int] = {}
+    res_map: Dict[Tuple[str, Union[int, str]], int] = {}
     chain_to_int: Dict[str, int] = {}
     chain_ints: List[int] = []
 
@@ -86,13 +87,16 @@ def load_pdb_backbone(
             idx = len(coords_list)
             coords_list.append(np.stack([atoms["N"], atoms["CA"], atoms["C"]], axis=0))
             seq_chars.append(residues[key]["aa"])
-            c_id = key[0]
+            c_id, resseq, icode = key
             if c_id not in chain_to_int:
                 chain_to_int[c_id] = len(chain_to_int)
             chain_ids.append(c_id)
             chain_ints.append(chain_to_int[c_id])
-            res_ids.append(key)
-            res_map[key] = idx
+            res_label = f"{resseq}{icode}"
+            res_ids.append((c_id, resseq))
+            res_map[(c_id, res_label)] = idx
+            if icode == "":
+                res_map[(c_id, resseq)] = idx
 
     if not coords_list:
         raise ValueError(f"No complete (N, CA, C) backbone residues found in {pdb_path}.")
