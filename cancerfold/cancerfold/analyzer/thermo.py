@@ -13,22 +13,21 @@ KBT_PHYS = R_GAS * TEMP_PHYS  # ~0.61633 kcal/mol at 310.15 K
 def _solve_bar_root(
     dh_wt: jnp.ndarray,
     dh_mut: jnp.ndarray,
-    kbt: float,
+    kbt: jnp.ndarray,
     num_iters: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Solves the exact minimum-variance Bennett (1976) Acceptance Ratio equation:
         sum_{i=1}^{N_F} sigmoid(-beta * (dh_wt_i - c*)) - sum_{j=1}^{N_R} sigmoid(-beta * (-dh_mut_j + c*)) = 0
-    where BOTH dh_wt and dh_mut are Delta H(X) = H_Mut(X) - H_WT(X) evaluated on the
-    WT and Mut equilibrium ensembles, respectively.
     Exact for arbitrary sample sizes N_F, N_R via ddG = c* - k_B*T * ln(N_R / N_F).
     """
-    beta = 1.0 / kbt
+    kbt_f32 = jnp.asarray(kbt, dtype=jnp.float32)
+    beta = 1.0 / kbt_f32
     n_f = jnp.asarray(dh_wt.shape[0], dtype=jnp.float32)
     n_r = jnp.asarray(dh_mut.shape[0], dtype=jnp.float32)
-    offset = kbt * jnp.log(n_r / n_f)
+    offset = kbt_f32 * jnp.log(n_r / n_f)
 
-    margin = 12.0 * kbt + jnp.abs(offset)
+    margin = 12.0 * kbt_f32 + jnp.abs(offset)
     lo = jnp.minimum(jnp.min(dh_wt), jnp.min(dh_mut)) - margin
     hi = jnp.maximum(jnp.max(dh_wt), jnp.max(dh_mut)) + margin
 
@@ -48,7 +47,7 @@ def _solve_bar_root(
     return c_star - offset, c_star
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def bar_ddg(
     dh_wt: jnp.ndarray,
     dh_mut: jnp.ndarray,
@@ -57,9 +56,7 @@ def bar_ddg(
 ) -> jnp.ndarray:
     """
     Exact, thermodynamically antisymmetric, implicitly differentiable BAR estimator.
-    Guarantees for ANY N_F, N_R:
-      - Exact WT <-> Mut antisymmetry: bar_ddg(-dh_mut, -dh_wt) == -bar_ddg(dh_wt, dh_mut)
-      - Exact smooth gradients via Implicit Function Theorem for Optax training.
+    JIT-traceable w.r.t. dynamic per-mutation kbt; exact antisymmetry for ANY N_F, N_R.
     """
     ddg, _ = _solve_bar_root(dh_wt, dh_mut, kbt, num_iters)
     return ddg
@@ -68,20 +65,20 @@ def bar_ddg(
 def _bar_fwd(
     dh_wt: jnp.ndarray,
     dh_mut: jnp.ndarray,
-    kbt: float,
+    kbt: jnp.ndarray,
     num_iters: int,
 ):
-    ddg, c_star = _solve_bar_root(dh_wt, dh_mut, kbt, num_iters)
-    return ddg, (dh_wt, dh_mut, c_star)
+    kbt_f32 = jnp.asarray(kbt, dtype=jnp.float32)
+    ddg, c_star = _solve_bar_root(dh_wt, dh_mut, kbt_f32, num_iters)
+    return ddg, (dh_wt, dh_mut, kbt_f32, c_star)
 
 
-def _bar_bwd(kbt: float, num_iters: int, res, g_out: jnp.ndarray):
-    dh_wt, dh_mut, c_star = res
-    beta = 1.0 / kbt
+def _bar_bwd(num_iters: int, res, g_out: jnp.ndarray):
+    dh_wt, dh_mut, kbt_f32, c_star = res
+    beta = 1.0 / kbt_f32
     n_f = float(dh_wt.shape[0])
     n_r = float(dh_mut.shape[0])
 
-    # Implicit Function Theorem on sum(f) - sum(r) = 0
     f = jax.nn.sigmoid(-beta * (dh_wt - c_star))
     r = jax.nn.sigmoid(-beta * (-dh_mut + c_star))
     w_f = f * (1.0 - f)
@@ -91,7 +88,7 @@ def _bar_bwd(kbt: float, num_iters: int, res, g_out: jnp.ndarray):
     safe_denom = jnp.maximum(denom, 1e-12)
     grad_wt = jnp.where(denom > 1e-10, w_f / safe_denom, 0.5 / n_f)
     grad_mut = jnp.where(denom > 1e-10, w_r / safe_denom, 0.5 / n_r)
-    return g_out * grad_wt, g_out * grad_mut
+    return g_out * grad_wt, g_out * grad_mut, jnp.zeros_like(kbt_f32)
 
 
 bar_ddg.defvjp(_bar_fwd, _bar_bwd)
@@ -107,10 +104,11 @@ def bar_overlap_diagnostic(
     Computes normalized phase-space overlap in [0, 1] and Delta-method sandwich std_err
     (exact 0 for identical states, always non-negative, valid for arbitrary N_F != N_R).
     """
-    beta = 1.0 / kbt
+    kbt_f32 = jnp.asarray(kbt, dtype=jnp.float32)
+    beta = 1.0 / kbt_f32
     n_f = jnp.asarray(dh_wt.shape[0], dtype=jnp.float32)
     n_r = jnp.asarray(dh_mut.shape[0], dtype=jnp.float32)
-    c_star = ddg + kbt * jnp.log(n_r / n_f)
+    c_star = ddg + kbt_f32 * jnp.log(n_r / n_f)
 
     f = jax.nn.sigmoid(-beta * (dh_wt - c_star))
     r = jax.nn.sigmoid(-beta * (-dh_mut + c_star))
@@ -119,9 +117,8 @@ def bar_overlap_diagnostic(
     max_fisher = (n_f * n_r) / jnp.maximum(n_f + n_r, 1.0)
     overlap_score = jnp.clip(fisher_sum / jnp.maximum(max_fisher, 1e-8), 0.0, 1.0)
 
-    # Delta-method sandwich variance on g(c) = sum(f) - sum(r)
     var_g = jnp.sum((f - jnp.mean(f)) ** 2) + jnp.sum((r - jnp.mean(r)) ** 2)
-    std_err = kbt * jnp.sqrt(jnp.maximum(var_g, 0.0)) / jnp.maximum(fisher_sum, 1e-8)
+    std_err = kbt_f32 * jnp.sqrt(jnp.maximum(var_g, 0.0)) / jnp.maximum(fisher_sum, 1e-8)
 
     return {
         "overlap_score": overlap_score,
@@ -208,11 +205,9 @@ def binding_ddg_bar(
     """
     Exact SKEMPI 2.0 / Protein-Drug Bound-Unbound Thermodynamic Cycle via BAR:
         ddG_bind = dG_complex(WT -> Mut) - [dG_unbound_A(WT -> Mut) + dG_unbound_B(WT -> Mut)]
-
-    Pass separate `single_*_unbound / pair_*_unbound` (computed from isolated monomer Joltz-1
-    runs) so an unmutated partner has exact zero response when unbound (no complex-context leakage).
+    Reports true bound-minus-unbound white-box attribution (`dh_phys_mean`, `dh_nn_mean`).
     """
-    kbt = R_GAS * temp_k
+    kbt = R_GAS * jnp.asarray(temp_k, dtype=jnp.float32)
     complex_mask = jnp.clip(partner_a_mask + partner_b_mask, 0.0, 1.0)
 
     s_wt_u = single_wt if single_wt_unbound is None else single_wt_unbound
@@ -233,30 +228,30 @@ def binding_ddg_bar(
     )
     ddg_complex = bar_ddg(dh_c_wt, dh_c_mut, kbt)
 
-    # 2. Unbound Partner A leg (isolated monomer/group A)
+    # 2. Unbound Partner A leg
     ens_a_wt = complex_wt_ens if unbound_a_wt_ens is None else unbound_a_wt_ens
     ens_a_mut = complex_mut_ens if unbound_a_mut_ens is None else unbound_a_mut_ens
-    dh_a_wt, _ = evaluate_dh_batch(
+    dh_a_wt, parts_a_wt = evaluate_dh_batch(
         ens_a_wt, d_ref_ca, phys_wt, phys_mut, weights, partner_a_mask, theta,
         single_wt=s_wt_u, pair_wt=z_wt_u, single_mut=s_mut_u, pair_mut=z_mut_u,
         nn_params=nn_params, chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
     )
-    dh_a_mut, _ = evaluate_dh_batch(
+    dh_a_mut, parts_a_mut = evaluate_dh_batch(
         ens_a_mut, d_ref_ca, phys_wt, phys_mut, weights, partner_a_mask, theta,
         single_wt=s_wt_u, pair_wt=z_wt_u, single_mut=s_mut_u, pair_mut=z_mut_u,
         nn_params=nn_params, chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
     )
     ddg_unbound_a = bar_ddg(dh_a_wt, dh_a_mut, kbt)
 
-    # 3. Unbound Partner B leg (isolated monomer/group B or small-molecule drug)
+    # 3. Unbound Partner B leg
     ens_b_wt = complex_wt_ens if unbound_b_wt_ens is None else unbound_b_wt_ens
     ens_b_mut = complex_mut_ens if unbound_b_mut_ens is None else unbound_b_mut_ens
-    dh_b_wt, _ = evaluate_dh_batch(
+    dh_b_wt, parts_b_wt = evaluate_dh_batch(
         ens_b_wt, d_ref_ca, phys_wt, phys_mut, weights, partner_b_mask, theta,
         single_wt=s_wt_u, pair_wt=z_wt_u, single_mut=s_mut_u, pair_mut=z_mut_u,
         nn_params=nn_params, chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
     )
-    dh_b_mut, _ = evaluate_dh_batch(
+    dh_b_mut, parts_b_mut = evaluate_dh_batch(
         ens_b_mut, d_ref_ca, phys_wt, phys_mut, weights, partner_b_mask, theta,
         single_wt=s_wt_u, pair_wt=z_wt_u, single_mut=s_mut_u, pair_mut=z_mut_u,
         nn_params=nn_params, chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
@@ -267,6 +262,18 @@ def binding_ddg_bar(
     ddg_bind = ddg_complex - ddg_unbound
     diag = bar_overlap_diagnostic(dh_c_wt, dh_c_mut, ddg_complex, kbt)
 
+    # True bound-minus-unbound white-box attribution (intra-chain self-energies cancel cleanly)
+    dh_phys_c = 0.5 * (jnp.mean(parts_c_wt["dh_phys"]) + jnp.mean(parts_c_mut["dh_phys"]))
+    dh_phys_u = 0.5 * (
+        jnp.mean(parts_a_wt["dh_phys"]) + jnp.mean(parts_a_mut["dh_phys"])
+        + jnp.mean(parts_b_wt["dh_phys"]) + jnp.mean(parts_b_mut["dh_phys"])
+    )
+    dh_nn_c = 0.5 * (jnp.mean(parts_c_wt["dh_nn"]) + jnp.mean(parts_c_mut["dh_nn"]))
+    dh_nn_u = 0.5 * (
+        jnp.mean(parts_a_wt["dh_nn"]) + jnp.mean(parts_a_mut["dh_nn"])
+        + jnp.mean(parts_b_wt["dh_nn"]) + jnp.mean(parts_b_mut["dh_nn"])
+    )
+
     return {
         "ddg_bind": ddg_bind,
         "ddg_complex": ddg_complex,
@@ -275,8 +282,8 @@ def binding_ddg_bar(
         "ddg_unbound_b": ddg_unbound_b,
         "overlap_score": diag["overlap_score"],
         "std_err": diag["std_err"],
-        "dh_phys_mean": 0.5 * (jnp.mean(parts_c_wt["dh_phys"]) + jnp.mean(parts_c_mut["dh_phys"])),
-        "dh_nn_mean": 0.5 * (jnp.mean(parts_c_wt["dh_nn"]) + jnp.mean(parts_c_mut["dh_nn"])),
+        "dh_phys_mean": dh_phys_c - dh_phys_u,
+        "dh_nn_mean": dh_nn_c - dh_nn_u,
     }
 
 
