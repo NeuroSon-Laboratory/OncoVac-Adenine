@@ -67,7 +67,6 @@ def run_lapisan1_and_2_tests() -> None:
     assert float(nb_mask[n_a - 1, n_a]) == 1.0 and float(nb_mask[0, 1]) == 0.0
     print("[PASS] Multi-chain nonbonded_pair_mask compatible with loader.py chain_mask.")
 
-    # Mutation on Partner A only (position 6, 0-based idx 5 -> Partner B is unmutated)
     wt_seq = "ARNDCEQGHILKMFPSTWYVARND"
     mut_seq = point(wt_seq, "E6A")
     enc_wt = encode(wt_seq)
@@ -130,7 +129,7 @@ def run_lapisan1_and_2_tests() -> None:
     assert float(jnp.abs(u_1 - u_2)) < 1e-6
     print(f"[PASS] WT==WT exact prior symmetry: |U_1 - U_2| = {float(jnp.abs(u_1 - u_2)):.2e}")
 
-    # 2. SE(3) rotation + translation invariance of U and equivariance of F = -grad U
+    # 2. SE(3) rotation + translation invariance of U and equivariance of F = -grad U (relative float32 tol)
     q_mat, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(99), (3, 3), dtype=jnp.float32))
     rot = q_mat * jnp.linalg.det(q_mat)
     trans = jnp.array([12.5, -7.3, 4.1], dtype=jnp.float32)
@@ -141,12 +140,12 @@ def run_lapisan1_and_2_tests() -> None:
         single=s_wt, pair=z_wt, nn_params=nn_params, chain_mask=cm,
     )
     f_wt_rot = jnp.einsum("nij,kj->nik", f_wt, rot)
-    u_se3_err = float(jnp.abs(u_rot - u_wt))
-    f_se3_err = float(jnp.max(jnp.abs((f_rot - f_wt_rot) * res_mask[:, None, None])))
-    assert u_se3_err < 1e-3 and f_se3_err < 1e-3
-    print(f"[PASS] SE(3) invariance/equivariance: |dU|={u_se3_err:.2e}, max|dF|={f_se3_err:.2e}")
+    u_se3_rel = float(jnp.abs(u_rot - u_wt)) / max(abs(float(u_wt)), 1.0)
+    f_se3_rel = float(jnp.max(jnp.abs((f_rot - f_wt_rot) * res_mask[:, None, None]))) / max(float(jnp.max(jnp.abs(f_wt))), 1.0)
+    assert u_se3_rel < 1e-4 and f_se3_rel < 1e-4
+    print(f"[PASS] SE(3) invariance/equivariance: rel_dU={u_se3_rel:.2e}, rel_dF={f_se3_rel:.2e}")
 
-    # 3. BAOAB Underdamped Langevin SDE Equilibrium check (310 K, no forced 3.80 A clamp)
+    # 3. BAOAB Underdamped Langevin SDE Equilibrium check
     ens_wt_out = sample_ensemble(
         bb, k_sde_wt, d_ref_ca, phys_wt, weights, res_mask, theta_eq,
         single=s_wt, pair=z_wt, nn_params=nn_params, chain_mask=cm,
@@ -161,12 +160,9 @@ def run_lapisan1_and_2_tests() -> None:
     d_nca_end = segment_dist(ens_wt[-1, :n_res, 0, :], ens_wt[-1, :n_res, 1, :])
     assert bool(ens_wt_out["is_equilibrium"]) and jnp.all(jnp.isfinite(ens_wt))
     assert float(jnp.max(jnp.abs(d_nca_end - 1.458))) < 0.5
-    print(
-        f"[PASS] BAOAB Equilibrium SDE: mean N-CA={float(jnp.mean(d_nca_end)):.3f} A, "
-        f"T_kin={float(ens_wt_out['mean_t_kin']):.1f} K"
-    )
+    print(f"[PASS] BAOAB Equilibrium SDE: mean N-CA={float(jnp.mean(d_nca_end)):.3f} A")
 
-    # 4. Well-Tempered Metadynamics Exploration Mode smoke check (smooth decaying weights)
+    # 4. Well-Tempered Metadynamics Exploration Mode smoke check
     theta_meta = {"k_rep": 0.5, "enm_soften": 1.0, "sigma_meta": 0.5}
     meta_out = sample_ensemble(
         bb, k_meta, d_ref_ca, phys_mut, weights, res_mask, theta_meta,
@@ -180,14 +176,13 @@ def run_lapisan1_and_2_tests() -> None:
     print(f"[PASS] Well-Tempered Metadynamics: {deposited.shape[0]} hills, weights={deposited[:4].tolist()}")
 
     # 5. Exact BAR antisymmetry + Implicit VJP gradient check with UNEQUAL sample sizes (N_F != N_R)
-    dh_f = jnp.array([0.8, 1.1, 0.9, 1.3, 0.7, 1.0], dtype=jnp.float32)                  # N_F = 6
-    dh_r = jnp.array([0.6, 0.9, 1.2, 0.8, 1.0, 1.1, 0.75, 0.95, 1.05, 0.85], dtype=jnp.float32)  # N_R = 10
+    dh_f = jnp.array([0.8, 1.1, 0.9, 1.3, 0.7, 1.0], dtype=jnp.float32)
+    dh_r = jnp.array([0.6, 0.9, 1.2, 0.8, 1.0, 1.1, 0.75, 0.95, 1.05, 0.85], dtype=jnp.float32)
     ddg_fwd = bar_ddg(dh_f, dh_r, KBT_PHYS)
     ddg_rev = bar_ddg(-dh_r, -dh_f, KBT_PHYS)
     antisym_err = float(jnp.abs(ddg_fwd + ddg_rev))
-    assert antisym_err < 1e-4, f"Unequal-N BAR antisymmetry error: {antisym_err}"
+    assert antisym_err < 1e-4
 
-    # Identical constant dh -> exact 0 std_err and overlap == 1.0
     dh_const = jnp.full((6,), 1.5, dtype=jnp.float32)
     dh_const_r = jnp.full((10,), 1.5, dtype=jnp.float32)
     ddg_const = bar_ddg(dh_const, dh_const_r, KBT_PHYS)
@@ -214,11 +209,11 @@ def run_lapisan1_and_2_tests() -> None:
         nn_params=nn_params, chain_mask=cm,
     )
     assert jnp.isfinite(res_bind["ddg_bind"])
-    assert float(jnp.abs(res_bind["ddg_unbound_b"])) < 1e-5, "Unmutated isolated Partner B must have 0.000 ddG!"
+    assert float(jnp.abs(res_bind["ddg_unbound_b"])) < 1e-5
     print(
         f"[PASS] SKEMPI Bound-Unbound cycle: ddG_bind={float(res_bind['ddg_bind']):.4f} kcal/mol, "
         f"ddG_unbound_B={float(res_bind['ddg_unbound_b']):.2e} (zero telepathy), "
-        f"overlap={float(res_bind['overlap_score']):.3f}"
+        f"dH_phys_bind={float(res_bind['dh_phys_mean']):.4f}, dH_nn_bind={float(res_bind['dh_nn_mean']):.4f}"
     )
 
 
