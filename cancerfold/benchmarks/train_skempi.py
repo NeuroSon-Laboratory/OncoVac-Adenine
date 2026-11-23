@@ -22,7 +22,7 @@ from cancerfold.physics.sde import R_GAS, sample_ensemble
 SKEMPI_CSV_URL = "https://life.bsc.es/pid/skempi2/database/download/skempi_v2.csv"
 RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 
-# Compact, clean canonical SKEMPI 2.0 complexes (N <= 256) for fast complex-disjoint mini-benchmark
+# Compact canonical SKEMPI 2.0 complexes (N <= 352) for fast complex-disjoint mini-benchmark
 MINI_PDB_WHITELIST = [
     "1BRS",  # Barnase - Barstar
     "1PPF",  # Leukocyte elastase - OMTKY3
@@ -33,7 +33,6 @@ MINI_PDB_WHITELIST = [
     "1TAW",  # Trypsin - APPI
     "1ACB",  # Chymotrypsin - Eglin c
     "1TEC",  # Thermitase - Eglin c
-    "1DAN",  # Compact PPI control (filtered automatically if > max_n)
 ]
 
 
@@ -59,7 +58,7 @@ def _parse_temp_k(raw: str) -> float:
 def load_skempi_records(
     cache_dir: str = "/tmp/skempi2_cache",
     pdb_whitelist: Optional[List[str]] = None,
-    max_n: int = 256,
+    max_n: int = 352,
     max_per_pdb: int = 20,
 ) -> List[Dict[str, object]]:
     """
@@ -96,13 +95,11 @@ def load_skempi_records(
                 continue
 
             temp_k = _parse_temp_k(row.get("Temperature", "298.15"))
-            # Official SKEMPI 2.0 convention: ddG = R * T * ln(Kd_mut / Kd_wt) (>0 destabilizing)
             ddg_exp = float(R_GAS * temp_k * np.log(kd_mut / kd_wt))
             if not np.isfinite(ddg_exp) or abs(ddg_exp) > 12.0:
                 continue
             grouped_ddg[(pdb_id, ch_a_str, ch_b_str, mut_code)].append((ddg_exp, temp_k))
 
-    # Group by complex to load each PDB once
     by_complex: Dict[Tuple[str, str, str], List[Tuple[str, float, float]]] = defaultdict(list)
     for (pdb_id, ch_a, ch_b, mut_code), vals in grouped_ddg.items():
         ddg_mean = float(np.mean([v[0] for v in vals]))
@@ -203,9 +200,9 @@ def prepare_ensembles_and_priors(
     c_s: int = 384,
     c_z: int = 128,
     num_replicas: int = 2,
-    num_steps: int = 60,
-    burn_in: int = 20,
-    stride: int = 20,
+    num_steps: int = 35,
+    burn_in: int = 15,
+    stride: int = 10,
 ) -> List[Dict[str, object]]:
     """
     Stage 1 (Offline): Runs Equilibrium BAOAB SDE (k_rep=0.0) on real crystal PDBs under H_phys
@@ -287,10 +284,10 @@ def _huber_loss(pred: jnp.ndarray, target: jnp.ndarray, delta: float = 1.5) -> j
 
 
 def run_mini_skempi_benchmark(
-    max_n: int = 256,
-    max_per_pdb: int = 12,
-    epochs: int = 25,
-    lr: float = 2e-3,
+    max_n: int = 352,
+    max_per_pdb: int = 6,
+    epochs: int = 10,
+    lr: float = 5e-4,
     weight_decay: float = 1e-2,
     joltz_forward_fn: Optional[Callable] = None,
 ) -> None:
@@ -342,11 +339,10 @@ def run_mini_skempi_benchmark(
         print(
             f"[{label}] r={float(m['pearson_r']):+.3f} | rho={float(m['spearman_rho']):+.3f} | "
             f"RMSE={float(m['rmse']):.3f} | MAE={float(m['mae']):.3f} | "
-            f"mean|dH_phys|={np.mean(phys_abs):.3f} vs mean|dH_nn|={np.mean(nn_abs):.3f}"
+            f"mean|dH_phys_bind|={np.mean(phys_abs):.3f} vs mean|dH_nn_bind|={np.mean(nn_abs):.3f}"
         )
         return {k: float(v) for k, v in m.items()}
 
-    # Zero-shot pure H_phys baseline (before any ML training)
     print("\n--- Zero-Shot Pure Analytical Physics (H_phys only) ---")
     _eval_split(None, val_items, "VAL Zero-Shot H_phys")
 
@@ -360,8 +356,8 @@ def run_mini_skempi_benchmark(
                 single_mut_unbound=s_mut, pair_mut_unbound=z_mut,
                 nn_params=p, chain_mask=cm, temp_k=tk,
             )
-            # Mild white-box penalty keeping U_NN as a physical residual
-            nn_reg = 1e-3 * (out["dh_nn_mean"] ** 2)
+            # White-box regularization on true bound-minus-unbound neural residual
+            nn_reg = 2e-2 * (out["dh_nn_mean"] ** 2)
             return _huber_loss(out["ddg_bind"], y_true) + nn_reg
         return jax.value_and_grad(_loss_fn)(params)
 
@@ -387,7 +383,6 @@ def run_mini_skempi_benchmark(
             _eval_split(nn_params, train_items, f"TRAIN ep{ep:02d}")
             _eval_split(nn_params, val_items, f"VAL   ep{ep:02d}")
 
-    # Exact antisymmetry audit on unseen validation complexes
     antisym_errs = []
     for x in val_items[:5]:
         fwd = _predict_one(
