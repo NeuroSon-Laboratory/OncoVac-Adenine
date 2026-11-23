@@ -15,6 +15,7 @@ import types
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 STD_AA = set("ACDEFGHIKLMNPQRSTVWY")
@@ -141,10 +142,10 @@ class Joltz1Runner:
         self,
         boltz_cache_dir: str = "/content/boltz_cache",
         prior_cache_dir: str = "/content/oncovac_cache/joltz_priors",
-        recycling_steps: int = 1,
+        recycling_steps: int = 0,
         use_msa: bool = False,
-        max_msa_seqs: int = 256,
-        buckets: Tuple[int, ...] = (128, 256, 384, 512),
+        max_msa_seqs: int = 64,
+        buckets: Tuple[int, ...] = (128, 256, 320, 384, 448, 512),
     ) -> None:
         install_fairscale_shim()
         jax.config.update("jax_default_matmul_precision", "float32")
@@ -204,16 +205,27 @@ class Joltz1Runner:
         finally:
             torch.load = orig_load
 
-        self.model = joltz.from_torch(torch_model)
+        # Move NumPy weight leaves to JAX device arrays BEFORE JIT so XLA never constant-folds them!
+        raw_joltz = joltz.from_torch(torch_model)
         del torch_model
         gc.collect()
-        print(f"[JOLTZ] Converted in {time.time() - t0:.1f}s on {jax.devices()[0]}", flush=True)
+        self.model = jax.tree_util.tree_map(
+            lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x,
+            raw_joltz,
+        )
+        del raw_joltz
+        gc.collect()
+        print(
+            f"[JOLTZ] Converted & placed on {jax.devices()[0]} in {time.time() - t0:.1f}s "
+            f"(rec={self.recycling_steps}, max_msa={self.max_msa_seqs})",
+            flush=True,
+        )
 
-        model = self.model
         rec = self.recycling_steps
 
+        # Pass `model` as an explicit dynamic argument to avoid XLA constant-folding 48 layers!
         @eqx.filter_jit
-        def _run_trunk_norm(feats: Dict[str, jax.Array]) -> Tuple[jax.Array, jax.Array]:
+        def _run_trunk_norm(model, feats: Dict[str, jax.Array]) -> Tuple[jax.Array, jax.Array]:
             out = model.trunk(
                 feats,
                 recycling_steps=rec,
@@ -367,10 +379,18 @@ class Joltz1Runner:
         batched = self._collate([feats])
         jax_feats = _to_numpy_dict(batched)
 
-        s_tok, z_tok = self._run_trunk_norm(jax_feats)
+        t_call = time.time()
+        s_tok, z_tok = self._run_trunk_norm(self.model, jax_feats)
         s_np = np.asarray(jax.device_get(s_tok[:n_res]), dtype=np.float32)
         z_np = np.asarray(jax.device_get(z_tok[:n_res, :n_res]), dtype=np.float32)
+        dt = time.time() - t_call
         self.trunk_calls += 1
+        if self.trunk_calls <= 6 or self.trunk_calls % 25 == 0:
+            print(
+                f"[JOLTZ] trunk #{self.trunk_calls:4d} ({pdb_id}_{state_tag}, N={n_res}->bucket={bucket_tok}) "
+                f"in {dt:.2f}s",
+                flush=True,
+            )
 
         # Map back from Boltz grouped-chain order to loader.py residue index order
         s_orig = np.zeros_like(s_np)
