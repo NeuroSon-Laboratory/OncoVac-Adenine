@@ -80,7 +80,6 @@ if not dst.exists():
     slim = {k: v for k, v in full_ccd.items() if k in keep}
     with dst.open("wb") as f:
         pickle.dump(slim, f)
-    # Self-check that RDKit atom 'name' properties survived pickling
     with dst.open("rb") as f:
         check = pickle.load(f)
     assert all(a.HasProp("name") for a in check["ALA"].GetAtoms()), "RDKit atom 'name' prop missing!"
@@ -351,7 +350,7 @@ class Joltz1Runner:
             raise RuntimeError(f"Boltz token mismatch for {pdb_id}_{state_tag}: {n_tok} != {n_res}")
 
         bucket_tok = self._pick_bucket(n_tok)
-        n_atoms = len(tokenized.atoms)
+        n_atoms = len(tokenized.structure.atoms)
         bucket_atoms = max(bucket_tok * 16, ((n_atoms + 127) // 128) * 128)
 
         feats = self._featurizer.process(
