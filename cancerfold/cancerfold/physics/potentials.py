@@ -70,7 +70,7 @@ def u_peptide_bonds(
     """
     m = residue_mask.astype(jnp.float32)
 
-    # 1. Intra-residue bonds (keeps every (N, CA, C) frame & chiral CB rigid during SDE)
+    # 1. Intra-residue bonds (keeps every (N, CA, C) frame & chiral CB intact while preserving thermal flexibility)
     n_pos, ca_pos, c_pos = backbone[:, 0, :], backbone[:, 1, :], backbone[:, 2, :]
     d_nca = _safe_norm(ca_pos - n_pos, axis=-1)
     d_cac = _safe_norm(c_pos - ca_pos, axis=-1)
@@ -149,7 +149,6 @@ def u_noncov_state(
     n = backbone.shape[0]
     off_diag = 1.0 - jnp.eye(n, dtype=jnp.float32)
 
-    # Exclude same-chain covalent 1-2 neighbors (i, i+1) from non-bonded side-chain terms
     if chain_mask is not None:
         same_chain = ((chain_mask[:-1] == chain_mask[1:]) & (chain_mask[:-1] >= 0)).astype(jnp.float32) * (m[:-1] * m[1:])
     else:
@@ -175,8 +174,8 @@ def u_noncov_state(
     else:
         raise ValueError(f"phys_state must have 4 or 5 feature columns, got shape {phys_state.shape}.")
 
-    # 1. Soft-core steric clash (factor 0.25 = 0.5 harmonic * 0.5 symmetric double-count correction)
-    r_vdw = theta.get("r_vdw_base", 3.2) + theta.get("r_vdw_scale", 1.2) * (vol[:, None] + vol[None, :])
+    # 1. Soft-core steric clash calibrated to true C_beta-C_beta clash distance (~3.0-3.6 A)
+    r_vdw = theta.get("r_vdw_base", 2.4) + theta.get("r_vdw_scale", 0.6) * (vol[:, None] + vol[None, :])
     overlap = jnp.maximum(0.0, r_vdw - d_cb)
     u_clash = 0.25 * theta.get("k_clash", 2.0) * jnp.sum(pair_valid * (overlap ** 2))
 
@@ -196,11 +195,11 @@ def u_noncov_state(
     # 3. Short-range hydrophobic (strictly h > 0 via ReLU) & H-bond interactions (cutoff 10 A)
     env_short = c2_envelope(d_cb, r_cut=theta.get("r_short", 10.0))
     h_pos = jax.nn.relu(hydro)
-    u_hydro = -0.5 * theta.get("k_hydro", 0.5) * jnp.sum(
+    u_hydro = -0.5 * theta.get("k_hydro", 1.5) * jnp.sum(
         pair_valid * env_short * (h_pos[:, None] * h_pos[None, :]) * jnp.exp(-0.5 * ((d_cb - 5.5) / 2.0) ** 2)
     )
     hb_pair = donor[:, None] * acc[None, :] + acc[:, None] * donor[None, :]
-    u_hbond = -0.5 * theta.get("k_hbond", 0.8) * jnp.sum(
+    u_hbond = -0.5 * theta.get("k_hbond", 1.5) * jnp.sum(
         pair_valid * env_short * hb_pair * jnp.exp(-0.5 * ((d_cb - 4.5) / 1.2) ** 2)
     )
 
