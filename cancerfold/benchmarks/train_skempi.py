@@ -62,7 +62,7 @@ def save_checkpoint(path: str, model_params: Dict[str, Dict[str, jnp.ndarray]]) 
     flat = {}
     for group, sub in model_params.items():
         for k, v in sub.items():
-            flat[f"{group}__{k}"] = np.asarray(v, dtype=np.float32)
+            flat[f"{group}__{k}"] = np.asarray(v, dtype=jnp.float32)
     np.savez_compressed(path, **flat)
 
 
@@ -384,25 +384,25 @@ def prepare_cached_ensembles(
     records: List[Dict[str, object]],
     prng_key: jax.Array,
     cache_dir: str = "/content/oncovac_cache",
-    n_frames: int = 4,
-    n_steps: int = 100,
-    burn_in: int = 40,
-    temp_k: float = 310.15,
+    num_replicas: int = 2,
+    num_steps: int = 40,
+    burn_in: int = 16,
+    stride: int = 8,
 ) -> List[Dict[str, object]]:
-    """Generates and disk-caches equilibrium BAOAB (310.15 K) ensembles in float16 (~50 KB/mut)."""
-    sde_dir = os.path.join(cache_dir, "sde_v2")
+    """Generates and disk-caches equilibrium BAOAB ensembles in float16 (~50 KB/mut)."""
+    sde_dir = os.path.join(cache_dir, f"baoab_n{records[0]['bb'].shape[0]}_r{num_replicas}_s{num_steps}")
     os.makedirs(sde_dir, exist_ok=True)
     theta_sde = {**PHYS_INIT, "k_rep": 0.0, "enm_soften": 1.0}
 
     @jax.jit
-    def _sample_state(key, bb, d_ref, phys, w, res_mask, cm):
+    def _sample_state(bb, key, d_ref, phys, w, res_mask, cm, tk):
         out = sample_ensemble(
-            key, bb, d_ref, phys, w, res_mask, theta_sde,
-            n_steps=n_steps, dt=0.02, temp_k=temp_k, gamma=2.0,
-            use_metadynamics=False, n_frames=n_frames, burn_in=burn_in,
-            chain_mask=cm,
+            bb, key, d_ref, phys, w, res_mask, theta_sde,
+            nn_params=None, chain_mask=cm,
+            num_replicas=num_replicas, num_steps=num_steps,
+            burn_in=burn_in, stride=stride, temp_k=tk,
         )
-        return out["frames"], out["mean_temp_k"]
+        return out["ensemble"], out["mean_t_kin"]
 
     items: List[Dict[str, object]] = []
     temps = []
@@ -411,10 +411,7 @@ def prepare_cached_ensembles(
 
     for i, rec in enumerate(records):
         safe_mut = re.sub(r"[^A-Za-z0-9_]+", "_", str(rec["mut_code"]))
-        npz_path = os.path.join(
-            sde_dir,
-            f"{rec['pdb_id']}_{safe_mut}_N{rec['bb'].shape[0]}_F{n_frames}.npz",
-        )
+        npz_path = os.path.join(sde_dir, f"{rec['pdb_id']}_{safe_mut}.npz")
         if os.path.exists(npz_path):
             cached = np.load(npz_path, allow_pickle=False)
             ens_wt = jnp.asarray(cached["ens_wt"], dtype=jnp.float32)
@@ -423,12 +420,15 @@ def prepare_cached_ensembles(
             t_mut = float(cached["t_mut"])
             n_loaded += 1
         else:
-            prng_key, kw, km = jax.random.split(prng_key, 3)
+            k_wt, k_mut = jax.random.split(jax.random.fold_in(prng_key, i))
+            tk = float(rec["temp_k"])
             ens_wt, t_wt_a = _sample_state(
-                kw, rec["bb"], rec["d_ref_ca"], rec["phys_wt"], rec["weights"], rec["res_mask"], rec["cm"]
+                rec["bb"], k_wt, rec["d_ref_ca"], rec["phys_wt"],
+                rec["weights"], rec["res_mask"], rec["cm"], tk,
             )
             ens_mut, t_mut_a = _sample_state(
-                km, rec["bb"], rec["d_ref_ca"], rec["phys_mut"], rec["weights"], rec["res_mask"], rec["cm"]
+                rec["bb"], k_mut, rec["d_ref_ca"], rec["phys_mut"],
+                rec["weights"], rec["res_mask"], rec["cm"], tk,
             )
             t_wt, t_mut = float(t_wt_a), float(t_mut_a)
             np.savez_compressed(
@@ -445,8 +445,9 @@ def prepare_cached_ensembles(
         temps.extend([t_wt, t_mut])
         items.append({**rec, "ens_wt": ens_wt, "ens_mut": ens_mut})
 
+    n_fr = int(items[0]["ens_wt"].shape[0]) if items else 0
     print(
-        f"[SDE] Ready {len(items)} mutation ensembles ({n_frames} frames/state | "
+        f"[SDE] Ready {len(items)} mutation ensembles ({n_fr} frames/state | "
         f"cached={n_loaded}, new={n_computed}) | mean T_kin={np.mean(temps):.1f} K "
         f"(min={np.min(temps):.1f}, max={np.max(temps):.1f})",
         flush=True,
@@ -487,7 +488,6 @@ def prepare_joltz_priors_cache(
         n_res = int(it["n_res"])
         cb_ref = np.asarray(virtual_cb(it["bb"][:n_res]), dtype=np.float32)
         d_cb = np.linalg.norm(cb_ref[:, None, :] - cb_ref[None, :, :], axis=-1)
-        # Also include any pair within 14 A in sampled BAOAB frames for strict bit-exactness
         cb_wt0 = np.asarray(virtual_cb(it["ens_wt"][0, :n_res]), dtype=np.float32)
         d_cb_min = np.minimum(d_cb, np.linalg.norm(cb_wt0[:, None, :] - cb_wt0[None, :, :], axis=-1))
         mask_b = d_cb_min <= contact_cutoff_a
