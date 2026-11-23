@@ -1,7 +1,9 @@
 """Frozen Joltz-1 (Boltz-1 JAX) Pairformer runner with LayerNorm scaling, XLA bucketing, and sparse contact cache."""
+import contextlib
 from dataclasses import asdict
 import gc
 import hashlib
+import io
 import os
 from pathlib import Path
 import pickle
@@ -39,19 +41,23 @@ def install_fairscale_shim() -> None:
 
 def ensure_protein_ccd(boltz_cache_dir: str) -> Path:
     """
-    Downloads Boltz-1 weights/CCD if missing and builds a slim canonical-residue ccd_protein.pkl (~150 KB)
+    Downloads Boltz-1 weights/CCD if missing and builds a slim canonical-residue ccd_protein_v2.pkl
+    preserving ALL RDKit molecule/atom/conformer properties (atom 'name', conformer 'Ideal', etc.)
     inside an isolated subprocess so the ~6 GB full-CCD RAM spike is returned to the OS immediately.
     """
     cache = Path(boltz_cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     ckpt_path = cache / "boltz1_conf.ckpt"
-    slim_path = cache / "ccd_protein.pkl"
+    slim_path = cache / "ccd_protein_v2.pkl"
     if ckpt_path.exists() and slim_path.exists():
         return slim_path
 
     helper = """
 import pickle, sys, types
 from pathlib import Path
+from rdkit import Chem
+Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+
 try:
     import fairscale
 except ImportError:
@@ -65,16 +71,20 @@ from boltz.data import const
 cache = Path(sys.argv[1])
 cache.mkdir(parents=True, exist_ok=True)
 download_boltz1(cache)
-dst = cache / "ccd_protein.pkl"
+dst = cache / "ccd_protein_v2.pkl"
 if not dst.exists():
-    print("[JOLTZ] Filtering ccd.pkl -> ccd_protein.pkl (saving ~6 GB RAM)...", flush=True)
+    print("[JOLTZ] Filtering ccd.pkl -> ccd_protein_v2.pkl with RDKit AllProps (saving ~6 GB RAM)...", flush=True)
     with (cache / "ccd.pkl").open("rb") as f:
         full_ccd = pickle.load(f)
     keep = set(const.tokens) | set(const.canonical_tokens)
     slim = {k: v for k, v in full_ccd.items() if k in keep}
     with dst.open("wb") as f:
         pickle.dump(slim, f)
-    print(f"[JOLTZ] Saved {len(slim)} canonical tokens to {dst} ({dst.stat().st_size / 1024:.1f} KB)", flush=True)
+    # Self-check that RDKit atom 'name' properties survived pickling
+    with dst.open("rb") as f:
+        check = pickle.load(f)
+    assert all(a.HasProp("name") for a in check["ALA"].GetAtoms()), "RDKit atom 'name' prop missing!"
+    print(f"[JOLTZ] Saved {len(slim)} canonical tokens to {dst} ({dst.stat().st_size / 1024:.1f} KB, props OK)", flush=True)
 """
     subprocess.run([sys.executable, "-c", helper, str(cache)], check=True)
     return slim_path
@@ -140,6 +150,9 @@ class Joltz1Runner:
         install_fairscale_shim()
         jax.config.update("jax_default_matmul_precision", "float32")
 
+        from rdkit import Chem
+        Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+
         self.boltz_cache_dir = Path(boltz_cache_dir)
         self.prior_cache_dir = Path(prior_cache_dir)
         self.prior_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +167,7 @@ class Joltz1Runner:
         slim_ccd_path = ensure_protein_ccd(str(self.boltz_cache_dir))
         with slim_ccd_path.open("rb") as f:
             self.ccd = pickle.load(f)
+        assert all(a.HasProp("name") for a in self.ccd["ALA"].GetAtoms()), "ccd_protein_v2.pkl missing atom props!"
 
         import equinox as eqx
         import torch
@@ -268,7 +282,7 @@ class Joltz1Runner:
                 row_key, row_seq = parts[0].strip(), parts[1].strip()
                 if strip_pairing:
                     row_key = "-1"
-                if row_idx == 0:
+                if row_idx == 0 and len(cur_seq) == len(row_seq):
                     row_seq = cur_seq
                 new_lines.append(f"{row_key},{row_seq}")
             with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as tf:
@@ -328,7 +342,8 @@ class Joltz1Runner:
             "bonds": [],
         }
 
-        target = self._parse_boltz_schema(f"{pdb_id}_{state_tag}", schema, self.ccd, None, False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            target = self._parse_boltz_schema(f"{pdb_id}_{state_tag}", schema, self.ccd, None, False)
         msas = self._build_chain_msas(pdb_id, groups, target.record.chains, strip_pairing=strip_pairing)
         tokenized = self._tokenizer.tokenize(self._Input(target.structure, msas, target.record, None))
         n_tok = len(tokenized.tokens)
