@@ -66,21 +66,17 @@ def baoab_step(
         forces_curr,
     )
 
-    # B (half kick) -> A (half drift)
     v_half = (velocities + 0.5 * (dt / mass) * f_eff_curr) * m
     x_half = (backbone + 0.5 * dt * v_half) * m
 
-    # O (exact Ornstein-Uhlenbeck velocity thermostat)
-    kbt = R_GAS * temp_k
+    kbt = R_GAS * jnp.asarray(temp_k, dtype=jnp.float32)
     c1 = jnp.exp(-gamma * dt)
     c2 = jnp.sqrt((kbt / mass) * jnp.maximum(1.0 - c1 ** 2, 0.0))
     xi = jax.random.normal(prng_key, backbone.shape, dtype=jnp.float32) * m
     v_therm = (c1 * v_half + c2 * xi) * m
 
-    # A (half drift) + global COM suppression
     x_next = center((x_half + 0.5 * dt * v_therm) * m, mask=residue_mask)
 
-    # Evaluate conservative Hamiltonian & force once at x_next
     u_next, f_next_raw, u_parts = full_state_energy_and_force(
         backbone=x_next,
         d_ref_ca=d_ref_ca,
@@ -104,7 +100,6 @@ def baoab_step(
         f_next_raw,
     )
 
-    # B (half kick)
     v_next = (v_therm + 0.5 * (dt / mass) * f_eff_next) * m
 
     f_max = jnp.max(jnp.sqrt(jnp.sum((f_next_raw * m) ** 2, axis=-1) + EPS_FORCE))
@@ -147,7 +142,7 @@ def run_sde_trajectory(
     use_adaptive_dielectric: bool = True,
 ) -> Dict[str, jnp.ndarray]:
     """
-    Runs a static-shape BAOAB Langevin trajectory via jax.lax.scan.
+    Runs a static-shape BAOAB Langevin trajectory via jax.lax.scan (temp_k is JIT-traceable).
       - Equilibrium Mode (theta['k_rep'] == 0.0): exact Boltzmann sampling for BAR / SKEMPI 2.0
         with force clipping disabled after burn_in to preserve detailed balance.
       - Exploration Mode (theta['k_rep'] > 0.0): Well-Tempered Metadynamics (Barducci et al. 2008)
@@ -155,8 +150,9 @@ def run_sde_trajectory(
     """
     max_n = backbone_init.shape[0]
     use_meta = float(theta.get("k_rep", 0.0)) > 0.0
-    t_start = float(temp_k) if temp_start is None else float(temp_start)
-    kbt_target = R_GAS * float(temp_k)
+    t_target = jnp.asarray(temp_k, dtype=jnp.float32)
+    t_start = t_target if temp_start is None else jnp.asarray(temp_start, dtype=jnp.float32)
+    kbt_target = R_GAS * t_target
     kbt_delta = jnp.maximum((wt_bias_factor - 1.0) * kbt_target, 1e-6)
 
     k_vel, k_scan = jax.random.split(prng_key)
@@ -193,7 +189,7 @@ def run_sde_trajectory(
 
         in_burn_in = step_idx < burn_in
         frac = jnp.minimum(1.0, step_idx.astype(jnp.float32) / jnp.maximum(1.0, float(burn_in)))
-        t_curr = t_start + frac * (float(temp_k) - t_start)
+        t_curr = t_start + frac * (t_target - t_start)
 
         x_next, v_next, f_next, u_next, diag = baoab_step(
             backbone=x_curr,
@@ -220,7 +216,6 @@ def run_sde_trajectory(
             use_adaptive_dielectric=use_adaptive_dielectric,
         )
 
-        # Well-Tempered Metadynamics hill deposition (never overwrites old hills)
         def _deposit(state):
             h_D, h_m, h_i = state
             v_bias_curr = u_metadynamics_bias(x_next, weights, h_D, h_m, theta)
@@ -324,8 +319,8 @@ def sample_ensemble(
         )
 
     out = jax.vmap(_run_one)(rep_keys)
-    traj = out["trajectory"]    # (num_replicas, K, MAX_N, 3, 3)
-    energies = out["energies"]  # (num_replicas, K)
+    traj = out["trajectory"]
+    energies = out["energies"]
 
     return {
         "ensemble": traj.reshape((-1,) + traj.shape[2:]),
