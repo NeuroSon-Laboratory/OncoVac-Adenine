@@ -1,4 +1,4 @@
-"""Pure-state SE(3)-invariant 2-hop neural residual potential with Dual-Cutoff (10 A / 16 A) & 7 orientation scalars."""
+"""Pure-state SE(3)-invariant 2-hop Effective-Hamiltonian residual potential (Dual-Cutoff + phys_state + pocket H_eff)."""
 from typing import Dict, Optional, Tuple
 import jax
 import jax.numpy as jnp
@@ -20,6 +20,8 @@ R_SHORT = 10.0  # Kills folded trunk contact prior smoothly before 11 A
 R_LONG = 16.0   # Preserves true long-range electrostatics / allosteric coupling
 EPS_NORM = 1e-5
 EPS_VEC = 1e-12
+PRIOR_TARGET_RMS = 0.15
+PRIOR_RMS_FLOOR = 0.05
 
 
 def _safe_unit(vec: jnp.ndarray) -> jnp.ndarray:
@@ -30,6 +32,29 @@ def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, bias: jnp.ndarray) -> jnp.nd
     mean = jnp.mean(x, axis=-1, keepdims=True)
     var = jnp.var(x, axis=-1, keepdims=True)
     return scale * (x - mean) / jnp.sqrt(var + EPS_NORM) + bias
+
+
+def _soft_rms_scale(x: jnp.ndarray, target: float = PRIOR_TARGET_RMS, floor: float = PRIOR_RMS_FLOOR) -> jnp.ndarray:
+    """
+    Smooth per-token / per-pair RMS balancing: maps both fallback priors (std ~0.05) and
+    LayerNormed Joltz-1 priors (std ~1.0) to a balanced ~0.10-0.15 scale matching 3D geometry & phys_state,
+    while keeping padded zero vectors exactly 0.0 and preserving exact WT <-> Mut symmetry.
+    """
+    rms = jnp.sqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + floor ** 2)
+    return (target / rms) * x
+
+
+def _pad_phys_5(phys_state: Optional[jnp.ndarray], n: int) -> jnp.ndarray:
+    """Normalizes biochemical node tensor to (n, 5): [vol, q, hydro, donor, acceptor]."""
+    if phys_state is None:
+        return jnp.zeros((n, 5), dtype=jnp.float32)
+    p = phys_state[:n].astype(jnp.float32)
+    d = p.shape[-1]
+    if d == 5:
+        return p
+    if d > 5:
+        return p[:, :5]
+    return jnp.pad(p, ((0, 0), (0, 5 - d)), mode="constant")
 
 
 def _glorot_uniform(key: jax.Array, shape: Tuple[int, ...], scale: float = 1.0) -> jnp.ndarray:
@@ -79,14 +104,16 @@ def init_folding_params(
     num_rbf_long: int = 8,
 ) -> Dict[str, jnp.ndarray]:
     """
-    Initializes parameters for the pure-state 2-hop SE(3) neural residual potential:
-      - Trainable linear compression from full Joltz-1 (c_s=384, c_z=128) -> c_h
+    Initializes parameters for the pure-state 2-hop SE(3) Effective-Hamiltonian neural residual:
+      - Dedicated local biochemical + live burial branch ([vol, q, hydro, donor, acc, burial])
+      - Balanced RMS-scaled Joltz-1 (c_s=384, c_z=128) -> c_h projection
       - Dual-Cutoff (10 A short contact / 16 A long dielectric) + 7 orientation scalars
       - 2-hop conservative message passing (2-body + 3-body many-body cooperativity)
     """
-    keys = jax.random.split(prng_key, 12)
+    keys = jax.random.split(prng_key, 14)
     d_short = 2 * num_rbf_short + 7  # CA_RBF + CB_RBF + 7 SE(3) orientation scalars
     d_long = num_rbf_long + 1        # Long-range CB_RBF + live 1/eps_eff(b_i, b_j)
+    d_phys = 6                       # [vol, q, hydro, donor, acceptor, live burial b_i]
 
     return {
         "w_short_1": _glorot_uniform(keys[0], (d_short, c_h)),
@@ -97,10 +124,15 @@ def init_folding_params(
         "b_long_1": jnp.zeros((c_h,), dtype=jnp.float32),
         "w_pair_proj": _glorot_uniform(keys[3], (c_z, c_h)),
         "b_pair_proj": jnp.zeros((c_h,), dtype=jnp.float32),
+        # Balanced prior + explicit local physical-biochemical node branches
         "w_single_val": _glorot_uniform(keys[4], (c_s, c_h)),
         "b_single_val": jnp.zeros((c_h,), dtype=jnp.float32),
-        "w_single_self": _glorot_uniform(keys[5], (c_s + 1, c_h)),  # +1 for live burial fraction b_i(X)
+        "w_single_self": _glorot_uniform(keys[5], (c_s, c_h)),
         "b_single_self": jnp.zeros((c_h,), dtype=jnp.float32),
+        "w_phys_val": _glorot_uniform(keys[11], (d_phys, c_h)),
+        "b_phys_val": jnp.zeros((c_h,), dtype=jnp.float32),
+        "w_phys_self": _glorot_uniform(keys[12], (d_phys, c_h)),
+        "b_phys_self": jnp.zeros((c_h,), dtype=jnp.float32),
         # Hop 1 (2-body pair interactions)
         "w_agg_1": _glorot_uniform(keys[6], (c_h, c_h)),
         "b_agg_1": jnp.zeros((c_h,), dtype=jnp.float32),
@@ -113,11 +145,11 @@ def init_folding_params(
         "b_agg_2": jnp.zeros((c_h,), dtype=jnp.float32),
         "ln_h2_scale": jnp.ones((c_h,), dtype=jnp.float32),
         "ln_h2_bias": jnp.zeros((c_h,), dtype=jnp.float32),
-        # Extensive per-residue energy readout (bounded small initial residual scale)
+        # Effective-pocket per-residue energy readout (bounded small initial residual)
         "w_readout_1": _glorot_uniform(keys[9], (c_h, c_h)),
         "b_readout_1": jnp.zeros((c_h,), dtype=jnp.float32),
-        "w_readout_2": _glorot_uniform(keys[10], (c_h, 1), scale=0.05),
-        "energy_scale": jnp.array(0.1, dtype=jnp.float32),
+        "w_readout_2": _glorot_uniform(keys[10], (c_h, 1), scale=0.08),
+        "energy_scale": jnp.array(0.2, dtype=jnp.float32),
     }
 
 
@@ -127,30 +159,37 @@ def single_state_nn_energy(
     pair: jnp.ndarray,
     residue_mask: jnp.ndarray,
     params: Dict[str, jnp.ndarray],
+    phys_state: Optional[jnp.ndarray] = None,
+    weights: Optional[jnp.ndarray] = None,
     r_short: float = R_SHORT,
     r_long: float = R_LONG,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Pure state function U_NN(X; s_alpha, z_alpha) with:
-      - Dual-Cutoff (10 A short contact channel / 16 A long dielectric channel)
-      - 7 SE(3)-invariant orientation scalars (including chiral pseudoscalar)
-      - Live coordination burial b_i(X) for desolvation & adaptive dielectric
+    Pure state function U_NN(X; s_alpha, z_alpha, phys_alpha) with Effective-Hamiltonian pocket localization:
+      - Dedicated local biochemical + live burial branch ([vol, q, hydro, donor, acc, burial])
+      - Smooth RMS-balanced frozen Joltz-1 (s, z) so global Pairformer channels never drown 3D geometry
+      - Dual-Cutoff (10 A short contact / 16 A long dielectric) + 7 SE(3) orientation scalars
       - 2-hop conservative message passing for 3-body many-body cooperativity
+      - Smooth continuous pocket envelope `weights` (Noisy-OR) suppressing distant global attention noise
     """
     n = backbone.shape[0]
-    single = single[:n]
-    pair = pair[:n, :n]
     m = residue_mask[:n].astype(jnp.float32)
     pair_valid = (m[:, None] * m[None, :]) * (1.0 - jnp.eye(n, dtype=jnp.float32))
+
+    # Balance prior scale smoothly across both fallback (~0.05) and Joltz-1 (~1.0)
+    s_bal = _soft_rms_scale(single[:n].astype(jnp.float32)) * m[:, None]
+    z_bal = _soft_rms_scale(pair[:n, :n].astype(jnp.float32)) * pair_valid[..., None]
 
     ca_pos = backbone[:, 1, :]
     cb_pos = virtual_cb(backbone)
     d_ca = pairwise_dist(ca_pos)
     d_cb = pairwise_dist(cb_pos)
 
-    # Live coordination burial b_i(X) and adaptive 1/eps_eff
+    # Live coordination burial b_i(X), adaptive 1/eps_eff, and explicit local biochemistry
     _, b_i = coordination_burial(d_cb, m)
     inv_eps = adaptive_inv_dielectric(b_i)
+    phys_5 = _pad_phys_5(phys_state, n)
+    phys_burial = jnp.concatenate([phys_5, b_i[:, None]], axis=-1) * m[:, None]
 
     # Short-range channel (<= 10 A): kills folded trunk prior cleanly before 11 A
     num_rbf_short = (params["w_short_1"].shape[0] - 7) // 2
@@ -165,7 +204,7 @@ def single_state_nn_energy(
     )
     g_s = jax.nn.silu(jnp.einsum("ijk,kl->ijl", feat_short, params["w_short_1"]) + params["b_short_1"])
     w_s = jnp.einsum("ijk,kl->ijl", g_s, params["w_short_2"]) + params["b_short_2"]
-    z_proj = jnp.einsum("ijk,kl->ijl", pair, params["w_pair_proj"]) + params["b_pair_proj"]
+    z_proj = jnp.einsum("ijk,kl->ijl", z_bal, params["w_pair_proj"]) + params["b_pair_proj"]
     e_short = jax.nn.silu(w_s + z_proj) * (c2_envelope(d_cb, r_short) * pair_valid)[..., None]
 
     # Long-range channel (<= 16 A): dielectric-modulated long-range coupling
@@ -180,10 +219,15 @@ def single_state_nn_energy(
 
     e_total = e_short + e_long
 
-    # Hop 1: 2-body pair aggregation + live burial desolvation self-term
-    s_val_1 = jax.nn.silu(jnp.einsum("ni,ij->nj", single, params["w_single_val"]) + params["b_single_val"])
-    s_with_burial = jnp.concatenate([single, b_i[:, None]], axis=-1)
-    s_self = jnp.einsum("ni,ij->nj", s_with_burial, params["w_single_self"]) + params["b_single_self"]
+    # Hop 1: balanced fusion of local biochemistry + burial + frozen Joltz-1 prior
+    s_val_1 = jax.nn.silu(
+        jnp.einsum("ni,ij->nj", phys_burial, params["w_phys_val"]) + params["b_phys_val"]
+        + jnp.einsum("ni,ij->nj", s_bal, params["w_single_val"]) + params["b_single_val"]
+    )
+    s_self = (
+        jnp.einsum("ni,ij->nj", phys_burial, params["w_phys_self"]) + params["b_phys_self"]
+        + jnp.einsum("ni,ij->nj", s_bal, params["w_single_self"]) + params["b_single_self"]
+    )
 
     msg_1 = jnp.einsum("ijh,jh->ih", e_total, s_val_1 * m[:, None]) / jnp.sqrt(K_SHELL)
     h_1 = _layer_norm(
@@ -201,9 +245,14 @@ def single_state_nn_energy(
         params["ln_h2_bias"],
     ) * m[:, None]
 
+    # Effective-Hamiltonian pocket readout: focuses neural residual smoothly on mutation neighborhood
     u_hid = jax.nn.silu(jnp.einsum("ih,hk->ik", h_2, params["w_readout_1"]) + params["b_readout_1"])
     u_raw = jnp.squeeze(jnp.einsum("ik,kl->il", u_hid, params["w_readout_2"]), axis=-1)
-    u_per_res = params["energy_scale"] * u_raw * m
+    if weights is not None:
+        eff_mask = m * jnp.clip(weights[:n].astype(jnp.float32), 0.0, 1.0)
+    else:
+        eff_mask = m
+    u_per_res = params["energy_scale"] * u_raw * eff_mask
     return jnp.sum(u_per_res), u_per_res
 
 
@@ -237,7 +286,10 @@ def full_state_energy(
     if nn_params is None:
         u_nn = jnp.array(0.0, dtype=jnp.float32)
     else:
-        u_nn, _ = single_state_nn_energy(backbone, single, pair, residue_mask, nn_params)
+        u_nn, _ = single_state_nn_energy(
+            backbone, single, pair, residue_mask, nn_params,
+            phys_state=phys_state, weights=weights,
+        )
 
     return u_phys + u_nn, {"u_phys": u_phys, "u_nn": u_nn, "u_shared": u_sh, "u_noncov": u_nc}
 
@@ -280,7 +332,10 @@ def full_state_energy_and_force(
         f_nn = jnp.zeros_like(f_phys)
     else:
         def _u_nn_fn(x_bb: jnp.ndarray) -> jnp.ndarray:
-            val, _ = single_state_nn_energy(x_bb, single, pair, residue_mask, nn_params)
+            val, _ = single_state_nn_energy(
+                x_bb, single, pair, residue_mask, nn_params,
+                phys_state=phys_state, weights=weights,
+            )
             return val
         u_nn, grad_nn = jax.value_and_grad(_u_nn_fn)(backbone)
         f_nn = -grad_nn
@@ -289,6 +344,8 @@ def full_state_energy_and_force(
 
 
 # References:
+#   - Nearsightedness of electronic & molecular matter (effective local Hamiltonian):
+#     Kohn (1996), Phys. Rev. Lett. 76(17):3168-3171.
 #   - Continuous-filter convolutional neural potentials & extensive energy summation:
 #     Schutt et al. (2018), J. Chem. Phys. 148(24):241722 (SchNet).
 #   - C^2-smooth polynomial radial cutoff envelopes & many-body message passing:
