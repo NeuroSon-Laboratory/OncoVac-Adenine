@@ -4,10 +4,11 @@ import csv
 import gc
 import os
 import re
+import shutil
 import time
 import urllib.request
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict, defaultdict
+from typing import Dict, List, Optional, Set, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +34,9 @@ PHYS_INIT = {
     "k_hydro": 1.5,
     "k_hbond": 1.5,
 }
+
+# Static sparse edge buckets for bit-exact GPU scatter (limits XLA compilation to 3-4 shapes)
+EDGE_BUCKETS = (4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 262144)
 
 
 def _inv_softplus(y: float) -> float:
@@ -62,18 +66,238 @@ def save_checkpoint(path: str, model_params: Dict[str, Dict[str, jnp.ndarray]]) 
     flat = {}
     for group, sub in model_params.items():
         for k, v in sub.items():
-            flat[f"{group}__{k}"] = np.asarray(v, dtype=jnp.float32)
-    np.savez_compressed(path, **flat)
+            flat[f"{group}__{k}"] = np.asarray(v, dtype=np.float32)
+    tmp_path = path + ".tmp.npz"
+    np.savez_compressed(tmp_path, **flat)
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path: str) -> Dict[str, Dict[str, jnp.ndarray]]:
     """Loads pickle-free .npz checkpoint back into the nested JAX parameter PyTree."""
-    data = np.load(path, allow_pickle=False)
     out: Dict[str, Dict[str, jnp.ndarray]] = {"phys_raw": {}, "nn": {}}
-    for key in data.files:
-        group, name = key.split("__", 1)
-        out[group][name] = jnp.asarray(data[key], dtype=jnp.float32)
+    with np.load(path, allow_pickle=False) as data:
+        for key in data.files:
+            group, name = key.split("__", 1)
+            out[group][name] = jnp.asarray(data[key], dtype=jnp.float32)
     return out
+
+
+def _sync_file_to_drive(src_path: str, dst_path: str) -> None:
+    """Best-effort atomic copy of a checkpoint or CSV file to Google Drive backup."""
+    if not src_path or not dst_path or not os.path.exists(src_path):
+        return
+    try:
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        tmp_dst = dst_path + ".tmp"
+        shutil.copy2(src_path, tmp_dst)
+        os.replace(tmp_dst, dst_path)
+    except Exception as exc:
+        print(f"[DRIVE][WARN] Failed syncing {os.path.basename(src_path)} ({exc}); continuing.", flush=True)
+
+
+def _init_synced_index(dst_dir: str) -> Set[str]:
+    """Lists existing relative paths in a Drive mirror once to avoid repeated FUSE stat calls."""
+    existing: Set[str] = set()
+    if not dst_dir or not os.path.isdir(dst_dir):
+        return existing
+    try:
+        for root, _, files in os.walk(dst_dir):
+            rel_root = os.path.relpath(root, dst_dir)
+            for fn in files:
+                if fn.endswith(".tmp") or ".tmp." in fn:
+                    continue
+                rel = fn if rel_root == "." else os.path.join(rel_root, fn)
+                existing.add(rel)
+    except Exception:
+        pass
+    return existing
+
+
+def _sync_dir_incremental(src_dir: str, dst_dir: str, already_synced: Set[str]) -> int:
+    """Incrementally copies only newly created files from src_dir to dst_dir (Drive-friendly)."""
+    if not src_dir or not dst_dir or not os.path.isdir(src_dir):
+        return 0
+    copied = 0
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        for root, _, files in os.walk(src_dir):
+            rel_root = os.path.relpath(root, src_dir)
+            dst_sub = dst_dir if rel_root == "." else os.path.join(dst_dir, rel_root)
+            for fn in files:
+                if fn.endswith(".tmp") or ".tmp." in fn:
+                    continue
+                rel = fn if rel_root == "." else os.path.join(rel_root, fn)
+                if rel in already_synced:
+                    continue
+                os.makedirs(dst_sub, exist_ok=True)
+                shutil.copy2(os.path.join(root, fn), os.path.join(dst_sub, fn))
+                already_synced.add(rel)
+                copied += 1
+    except Exception as exc:
+        print(f"[DRIVE][WARN] Incremental dir sync warning ({exc}); continuing.", flush=True)
+    return copied
+
+
+def _pick_edge_bucket(n_edges: int) -> int:
+    for b in EDGE_BUCKETS:
+        if n_edges <= b:
+            return b
+    return int(n_edges)
+
+
+class _SparsePriorLRU:
+    """
+    Bounded in-RAM LRU cache for sparse Joltz-1 .npz files (~1.5-3.5 MB each).
+    Eliminates repeated disk I/O across epochs while automatically capping memory
+    to <= min(24 GB, 35% of total RAM) so both A100 (83 GB) and T4 (12.7 GB) stay safe.
+    """
+
+    def __init__(self, max_bytes: Optional[int] = None) -> None:
+        if max_bytes is None:
+            total_ram = self._detect_total_ram_bytes()
+            max_bytes = min(24 * 1024 ** 3, int(total_ram * 0.35))
+        self.max_bytes = max(256 * 1024 ** 2, int(max_bytes))
+        self._cur_bytes = 0
+        self._cache: "OrderedDict[str, Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
+
+    @staticmethod
+    def _detect_total_ram_bytes() -> int:
+        try:
+            return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+        except Exception:
+            return 12 * 1024 ** 3
+
+    def get(self, path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        entry = self._cache.get(path)
+        if entry is not None:
+            self._cache.move_to_end(path)
+            return entry[1], entry[2], entry[3], entry[4]
+
+        with np.load(path, allow_pickle=False) as d:
+            s = np.array(d["s"], dtype=np.float16, copy=True)
+            rows = np.array(d["rows"], dtype=np.int16, copy=True)
+            cols = np.array(d["cols"], dtype=np.int16, copy=True)
+            z_vals = np.array(d["z_vals"], dtype=np.float16, copy=True)
+
+        nbytes = int(s.nbytes + rows.nbytes + cols.nbytes + z_vals.nbytes)
+        if nbytes <= self.max_bytes:
+            while self._cache and (self._cur_bytes + nbytes) > self.max_bytes:
+                _, evicted = self._cache.popitem(last=False)
+                self._cur_bytes -= evicted[0]
+            self._cache[path] = (nbytes, s, rows, cols, z_vals)
+            self._cur_bytes += nbytes
+        return s, rows, cols, z_vals
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._cur_bytes = 0
+
+
+def _pad_bound_edges(
+    r: np.ndarray, c: np.ndarray, z: np.ndarray, cap: int, max_n: int, c_z: int = 128
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r_out = np.full((cap,), max_n, dtype=np.int16)
+    c_out = np.full((cap,), max_n, dtype=np.int16)
+    z_out = np.zeros((cap, c_z), dtype=np.float16)
+    e = int(r.shape[0])
+    if e > 0:
+        r_out[:e] = r
+        c_out[:e] = c
+        z_out[:e] = z
+    return r_out, c_out, z_out
+
+
+def _pack_unbound_edges(
+    r_ua: np.ndarray, c_ua: np.ndarray, z_ua: np.ndarray, idx_a: np.ndarray,
+    r_ub: np.ndarray, c_ub: np.ndarray, z_ub: np.ndarray, idx_b: np.ndarray,
+    cap: int, max_n: int, c_z: int = 128,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Packs strictly intra-A and intra-B sparse edges (zero cross-partner telepathy)."""
+    r_out = np.full((cap,), max_n, dtype=np.int16)
+    c_out = np.full((cap,), max_n, dtype=np.int16)
+    z_out = np.zeros((cap, c_z), dtype=np.float16)
+    ea = int(r_ua.shape[0])
+    eb = int(r_ub.shape[0])
+    if ea > 0:
+        r_out[:ea] = idx_a[r_ua]
+        c_out[:ea] = idx_a[c_ua]
+        z_out[:ea] = z_ua
+    if eb > 0:
+        r_out[ea : ea + eb] = idx_b[r_ub]
+        c_out[ea : ea + eb] = idx_b[c_ub]
+        z_out[ea : ea + eb] = z_ub
+    return r_out, c_out, z_out
+
+
+def _pack_item_joltz_sparse(
+    x: Dict[str, object],
+    lru: _SparsePriorLRU,
+    c_s: int = 384,
+    c_z: int = 128,
+) -> Tuple[np.ndarray, ...]:
+    """
+    Loads sparse Joltz-1 arrays from RAM LRU cache and packs them into static edge buckets
+    (~6-16 MB vs ~268 MB dense CPU arrays) for bit-exact GPU scatter inside @jax.jit.
+    """
+    jp = x["joltz_paths"]
+    idx_a: np.ndarray = x["idx_a"]
+    idx_b: np.ndarray = x["idx_b"]
+    max_n = int(x["max_n"])
+
+    s_wb_raw, r_wb_raw, c_wb_raw, z_wb_raw = lru.get(jp["wt_b"])
+    s_wua_raw, r_wua_raw, c_wua_raw, z_wua_raw = lru.get(jp["wt_ua"])
+    s_wub_raw, r_wub_raw, c_wub_raw, z_wub_raw = lru.get(jp["wt_ub"])
+
+    s_mb_raw, r_mb_raw, c_mb_raw, z_mb_raw = lru.get(jp["mut_b"])
+    s_mua_raw, r_mua_raw, c_mua_raw, z_mua_raw = lru.get(jp["mut_ua"])
+    s_mub_raw, r_mub_raw, c_mub_raw, z_mub_raw = lru.get(jp["mut_ub"])
+
+    cap = _pick_edge_bucket(
+        max(
+            int(r_wb_raw.shape[0]),
+            int(r_mb_raw.shape[0]),
+            int(r_wua_raw.shape[0]) + int(r_wub_raw.shape[0]),
+            int(r_mua_raw.shape[0]) + int(r_mub_raw.shape[0]),
+        )
+    )
+
+    s_wb = np.zeros((max_n, c_s), dtype=np.float16)
+    s_wb[: s_wb_raw.shape[0]] = s_wb_raw
+    s_mb = np.zeros((max_n, c_s), dtype=np.float16)
+    s_mb[: s_mb_raw.shape[0]] = s_mb_raw
+
+    s_wu = np.zeros((max_n, c_s), dtype=np.float16)
+    s_wu[idx_a] = s_wua_raw
+    s_wu[idx_b] = s_wub_raw
+    s_mu = np.zeros((max_n, c_s), dtype=np.float16)
+    s_mu[idx_a] = s_mua_raw
+    s_mu[idx_b] = s_mub_raw
+
+    r_wb, c_wb, z_wb = _pad_bound_edges(r_wb_raw, c_wb_raw, z_wb_raw, cap, max_n, c_z)
+    r_mb, c_mb, z_mb = _pad_bound_edges(r_mb_raw, c_mb_raw, z_mb_raw, cap, max_n, c_z)
+    r_wu, c_wu, z_wu = _pack_unbound_edges(
+        r_wua_raw, c_wua_raw, z_wua_raw, idx_a, r_wub_raw, c_wub_raw, z_wub_raw, idx_b, cap, max_n, c_z
+    )
+    r_mu, c_mu, z_mu = _pack_unbound_edges(
+        r_mua_raw, c_mua_raw, z_mua_raw, idx_a, r_mub_raw, c_mub_raw, z_mub_raw, idx_b, cap, max_n, c_z
+    )
+    return (
+        s_wb, r_wb, c_wb, z_wb,
+        s_mb, r_mb, c_mb, z_mb,
+        s_wu, r_wu, c_wu, z_wu,
+        s_mu, r_mu, c_mu, z_mu,
+    )
+
+
+def _scatter_pair_gpu(
+    r: jnp.ndarray, c: jnp.ndarray, zv: jnp.ndarray, max_n: int, c_z: int = 128
+) -> jnp.ndarray:
+    """Bit-exact GPU scatter of sparse contact pair features into dense [max_n, max_n, c_z]."""
+    return (
+        jnp.zeros((max_n, max_n, c_z), dtype=jnp.float32)
+        .at[r.astype(jnp.int32), c.astype(jnp.int32)]
+        .set(zv.astype(jnp.float32), mode="drop")
+    )
 
 
 def _download_if_missing(url: str, dst_path: str) -> bool:
@@ -388,9 +612,11 @@ def prepare_cached_ensembles(
     num_steps: int = 40,
     burn_in: int = 16,
     stride: int = 8,
+    drive_backup_dir: str = "",
 ) -> List[Dict[str, object]]:
-    """Generates and disk-caches equilibrium BAOAB ensembles in float16 (~50 KB/mut)."""
-    sde_dir = os.path.join(cache_dir, f"baoab_n{records[0]['bb'].shape[0]}_r{num_replicas}_s{num_steps}")
+    """Generates and disk-caches equilibrium BAOAB ensembles in compact CPU float16 (~55 KB/state)."""
+    sde_subdir = f"baoab_n{records[0]['bb'].shape[0]}_r{num_replicas}_s{num_steps}"
+    sde_dir = os.path.join(cache_dir, sde_subdir)
     os.makedirs(sde_dir, exist_ok=True)
     theta_sde = {**PHYS_INIT, "k_rep": 0.0, "enm_soften": 1.0}
 
@@ -408,39 +634,48 @@ def prepare_cached_ensembles(
     temps = []
     n_loaded = 0
     n_computed = 0
+    t_sde = time.time()
 
     for i, rec in enumerate(records):
         safe_mut = re.sub(r"[^A-Za-z0-9_]+", "_", str(rec["mut_code"]))
         npz_path = os.path.join(sde_dir, f"{rec['pdb_id']}_{safe_mut}.npz")
         if os.path.exists(npz_path):
-            cached = np.load(npz_path, allow_pickle=False)
-            ens_wt = jnp.asarray(cached["ens_wt"], dtype=jnp.float32)
-            ens_mut = jnp.asarray(cached["ens_mut"], dtype=jnp.float32)
-            t_wt = float(cached["t_wt"])
-            t_mut = float(cached["t_mut"])
+            with np.load(npz_path, allow_pickle=False) as cached:
+                ens_wt = np.array(cached["ens_wt"], dtype=np.float16, copy=True)
+                ens_mut = np.array(cached["ens_mut"], dtype=np.float16, copy=True)
+                t_wt = float(cached["t_wt"])
+                t_mut = float(cached["t_mut"])
             n_loaded += 1
         else:
             k_wt, k_mut = jax.random.split(jax.random.fold_in(prng_key, i))
             tk = float(rec["temp_k"])
-            ens_wt, t_wt_a = _sample_state(
+            ens_wt_j, t_wt_a = _sample_state(
                 rec["bb"], k_wt, rec["d_ref_ca"], rec["phys_wt"],
                 rec["weights"], rec["res_mask"], rec["cm"], tk,
             )
-            ens_mut, t_mut_a = _sample_state(
+            ens_mut_j, t_mut_a = _sample_state(
                 rec["bb"], k_mut, rec["d_ref_ca"], rec["phys_mut"],
                 rec["weights"], rec["res_mask"], rec["cm"], tk,
             )
+            ens_wt = np.asarray(ens_wt_j, dtype=np.float16)
+            ens_mut = np.asarray(ens_mut_j, dtype=np.float16)
             t_wt, t_mut = float(t_wt_a), float(t_mut_a)
+            tmp_npz = npz_path + ".tmp.npz"
             np.savez_compressed(
-                npz_path,
-                ens_wt=np.asarray(ens_wt, dtype=np.float16),
-                ens_mut=np.asarray(ens_mut, dtype=np.float16),
+                tmp_npz,
+                ens_wt=ens_wt,
+                ens_mut=ens_mut,
                 t_wt=np.float32(t_wt),
                 t_mut=np.float32(t_mut),
             )
+            os.replace(tmp_npz, npz_path)
             n_computed += 1
-            if n_computed % 25 == 0:
-                print(f"[SDE] Progress: {i + 1}/{len(records)} ensembles ready...", flush=True)
+            if n_computed % 50 == 0:
+                print(
+                    f"[SDE] Progress: {i + 1}/{len(records)} ensembles ready "
+                    f"(new={n_computed}, elapsed={time.time() - t_sde:.1f}s)...",
+                    flush=True,
+                )
 
         temps.extend([t_wt, t_mut])
         items.append({**rec, "ens_wt": ens_wt, "ens_mut": ens_mut})
@@ -448,10 +683,16 @@ def prepare_cached_ensembles(
     n_fr = int(items[0]["ens_wt"].shape[0]) if items else 0
     print(
         f"[SDE] Ready {len(items)} mutation ensembles ({n_fr} frames/state | "
-        f"cached={n_loaded}, new={n_computed}) | mean T_kin={np.mean(temps):.1f} K "
-        f"(min={np.min(temps):.1f}, max={np.max(temps):.1f})",
+        f"cached={n_loaded}, new={n_computed}, elapsed={time.time() - t_sde:.1f}s) | "
+        f"mean T_kin={np.mean(temps):.1f} K (min={np.min(temps):.1f}, max={np.max(temps):.1f})",
         flush=True,
     )
+    if drive_backup_dir and n_computed > 0:
+        dst_sde = os.path.join(drive_backup_dir, "oncovac_cache", sde_subdir)
+        synced = _init_synced_index(dst_sde)
+        n_copy = _sync_dir_incremental(sde_dir, dst_sde, synced)
+        if n_copy > 0:
+            print(f"[DRIVE] Backed up {n_copy} new BAOAB ensemble caches to {dst_sde}", flush=True)
     return items
 
 
@@ -462,21 +703,27 @@ def prepare_joltz_priors_cache(
     recycling_steps: int = 1,
     use_msa: bool = False,
     contact_cutoff_a: float = 16.0,
+    drive_backup_dir: str = "",
 ) -> List[Dict[str, object]]:
     """
     Computes and disk-caches normalized frozen Joltz-1 (s, sparse z) for Bound & Unbound states.
     WT complex and unchanged unbound partner chains are computed once per PDB and deduplicated.
-    Frees Joltz-1 GPU/TPU HBM immediately when caching finishes.
+    Periodically backs up new caches to Google Drive and frees Joltz-1 HBM before training.
     """
     from cancerfold.af2_core.joltz_runner import Joltz1Runner
 
     t_start = time.time()
+    prior_local_dir = os.path.join(cache_dir, "joltz_priors")
     runner = Joltz1Runner(
         boltz_cache_dir=boltz_cache_dir,
-        prior_cache_dir=os.path.join(cache_dir, "joltz_priors"),
+        prior_cache_dir=prior_local_dir,
         recycling_steps=recycling_steps,
         use_msa=use_msa,
     )
+
+    drive_prior_dir = os.path.join(drive_backup_dir, "oncovac_cache", "joltz_priors") if drive_backup_dir else ""
+    synced_priors = _init_synced_index(drive_prior_dir) if drive_prior_dir else set()
+    last_sync_trunk = 0
 
     # Precompute symmetric contact pair indices (d_cb <= 16 A, generous 6 A margin over R_SHORT=10 A) per PDB
     pdb_contacts: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -488,7 +735,7 @@ def prepare_joltz_priors_cache(
         n_res = int(it["n_res"])
         cb_ref = np.asarray(virtual_cb(it["bb"][:n_res]), dtype=np.float32)
         d_cb = np.linalg.norm(cb_ref[:, None, :] - cb_ref[None, :, :], axis=-1)
-        cb_wt0 = np.asarray(virtual_cb(it["ens_wt"][0, :n_res]), dtype=np.float32)
+        cb_wt0 = np.asarray(virtual_cb(jnp.asarray(it["ens_wt"][0, :n_res], dtype=jnp.float32)), dtype=np.float32)
         d_cb_min = np.minimum(d_cb, np.linalg.norm(cb_wt0[:, None, :] - cb_wt0[None, :, :], axis=-1))
         mask_b = d_cb_min <= contact_cutoff_a
         np.fill_diagonal(mask_b, False)
@@ -507,6 +754,7 @@ def prepare_joltz_priors_cache(
         )
 
     enriched: List[Dict[str, object]] = []
+    skipped = 0
     for idx, it in enumerate(items):
         pid = str(it["pdb_id"])
         wt_seq = str(it["wt_seq"])
@@ -527,22 +775,27 @@ def prepare_joltz_priors_cache(
         cids_a = [cids[i] for i in idx_a]
         cids_b = [cids[i] for i in idx_b]
 
-        wt_b_path = runner.extract_sparse_priors(wt_seq, cids, r_b, c_b, pid, "bound", strip_pairing=False)
-        mut_b_path = runner.extract_sparse_priors(mut_seq, cids, r_b, c_b, pid, "bound", strip_pairing=False)
-        wt_ua_path = runner.extract_sparse_priors(wt_seq_a, cids_a, r_a, c_a, pid, "unbound_a", strip_pairing=True)
-        wt_ub_path = runner.extract_sparse_priors(wt_seq_b, cids_b, r_bb, c_bb, pid, "unbound_b", strip_pairing=True)
+        try:
+            wt_b_path = runner.extract_sparse_priors(wt_seq, cids, r_b, c_b, pid, "bound", strip_pairing=False)
+            mut_b_path = runner.extract_sparse_priors(mut_seq, cids, r_b, c_b, pid, "bound", strip_pairing=False)
+            wt_ua_path = runner.extract_sparse_priors(wt_seq_a, cids_a, r_a, c_a, pid, "unbound_a", strip_pairing=True)
+            wt_ub_path = runner.extract_sparse_priors(wt_seq_b, cids_b, r_bb, c_bb, pid, "unbound_b", strip_pairing=True)
 
-        # Unchanged unbound partner reuses WT prior bit-for-bit (exact zero telepathy)
-        mut_ua_path = (
-            wt_ua_path
-            if mut_seq_a == wt_seq_a
-            else runner.extract_sparse_priors(mut_seq_a, cids_a, r_a, c_a, pid, "unbound_a", strip_pairing=True)
-        )
-        mut_ub_path = (
-            wt_ub_path
-            if mut_seq_b == wt_seq_b
-            else runner.extract_sparse_priors(mut_seq_b, cids_b, r_bb, c_bb, pid, "unbound_b", strip_pairing=True)
-        )
+            # Unchanged unbound partner reuses WT prior bit-for-bit (exact zero telepathy)
+            mut_ua_path = (
+                wt_ua_path
+                if mut_seq_a == wt_seq_a
+                else runner.extract_sparse_priors(mut_seq_a, cids_a, r_a, c_a, pid, "unbound_a", strip_pairing=True)
+            )
+            mut_ub_path = (
+                wt_ub_path
+                if mut_seq_b == wt_seq_b
+                else runner.extract_sparse_priors(mut_seq_b, cids_b, r_bb, c_bb, pid, "unbound_b", strip_pairing=True)
+            )
+        except Exception as exc:
+            skipped += 1
+            print(f"[JOLTZ][WARN] Skipping {pid} {it['mut_code']} ({exc})", flush=True)
+            continue
 
         enriched.append({
             **it,
@@ -555,12 +808,23 @@ def prepare_joltz_priors_cache(
                 "mut_ub": mut_ub_path,
             },
         })
-        if (idx + 1) % 20 == 0 or (idx + 1) == len(items):
+        if (idx + 1) % 25 == 0 or (idx + 1) == len(items):
             print(
                 f"[JOLTZ] Cached {idx + 1}/{len(items)} mutations "
-                f"(new trunk evals={runner.trunk_calls}, elapsed={time.time() - t_start:.1f}s)",
+                f"(valid={len(enriched)}, skipped={skipped}, new trunk evals={runner.trunk_calls}, "
+                f"elapsed={time.time() - t_start:.1f}s)",
                 flush=True,
             )
+        if drive_prior_dir and (runner.trunk_calls - last_sync_trunk) >= 200:
+            n_copy = _sync_dir_incremental(prior_local_dir, drive_prior_dir, synced_priors)
+            last_sync_trunk = runner.trunk_calls
+            if n_copy > 0:
+                print(f"[DRIVE] Incremental backup: +{n_copy} Joltz/MSA files synced to Drive.", flush=True)
+
+    if drive_prior_dir and runner.trunk_calls > last_sync_trunk:
+        n_copy = _sync_dir_incremental(prior_local_dir, drive_prior_dir, synced_priors)
+        if n_copy > 0:
+            print(f"[DRIVE] Final Joltz/MSA backup: +{n_copy} files synced to Drive.", flush=True)
 
     runner.close()
     print("[JOLTZ] Freed Joltz-1 weights from accelerator memory before Optax training.", flush=True)
@@ -595,29 +859,102 @@ def _evaluate_zero_shot_hphys(items: List[Dict[str, object]]) -> List[Dict[str, 
     @jax.jit
     def _eval_phys(ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk):
         return binding_ddg_bar(
-            ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, theta_raw,
+            ens_wt.astype(jnp.float32), ens_mut.astype(jnp.float32),
+            d_ref, phys_wt, phys_mut, w, pa, pb, theta_raw,
             nn_params=None, chain_mask=cm, temp_k=tk,
         )
 
     rows = []
+    pending = []
     for x in items:
         out = _eval_phys(
             x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
             x["phys_wt"], x["phys_mut"], x["weights"],
             x["pa_mask"], x["pb_mask"], x["cm"], float(x["temp_k"]),
         )
-        rows.append({
-            "fold": -1,
-            "pdb_id": str(x["pdb_id"]),
-            "family": str(x["family"]),
-            "mut_code": str(x["mut_code"]),
-            "n_muts": int(x["n_muts"]),
-            "ddg_exp": float(x["ddg_exp"]),
-            "ddg_pred": float(out["ddg_bind"]),
-            "dh_phys": float(out["dh_phys_mean"]),
-            "dh_nn": float(out["dh_nn_mean"]),
-        })
+        pending.append((out["ddg_bind"], out["dh_phys_mean"], out["dh_nn_mean"], x))
+        if len(pending) >= 32:
+            vals = jax.device_get([(a, b, c) for a, b, c, _ in pending])
+            for (yp, dp, dn), (_, _, _, item) in zip(vals, pending):
+                rows.append({
+                    "fold": -1,
+                    "pdb_id": str(item["pdb_id"]),
+                    "family": str(item["family"]),
+                    "mut_code": str(item["mut_code"]),
+                    "n_muts": int(item["n_muts"]),
+                    "ddg_exp": float(item["ddg_exp"]),
+                    "ddg_pred": float(yp),
+                    "dh_phys": float(dp),
+                    "dh_nn": float(dn),
+                })
+            pending.clear()
+
+    if pending:
+        vals = jax.device_get([(a, b, c) for a, b, c, _ in pending])
+        for (yp, dp, dn), (_, _, _, item) in zip(vals, pending):
+            rows.append({
+                "fold": -1,
+                "pdb_id": str(item["pdb_id"]),
+                "family": str(item["family"]),
+                "mut_code": str(item["mut_code"]),
+                "n_muts": int(item["n_muts"]),
+                "ddg_exp": float(item["ddg_exp"]),
+                "ddg_pred": float(yp),
+                "dh_phys": float(dp),
+                "dh_nn": float(dn),
+            })
     return rows
+
+
+def _save_oof_csv(path: str, rows: List[Dict[str, object]]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fields = ["fold", "pdb_id", "family", "mut_code", "n_muts", "ddg_exp", "ddg_pred", "dh_phys", "dh_nn"]
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp_path, path)
+
+
+def _load_fold_oof_if_valid(
+    oof_csv_path: str,
+    ckpt_path: str,
+    meta_path: str,
+    val_items: List[Dict[str, object]],
+) -> Optional[Tuple[List[Dict[str, object]], float]]:
+    """Safely reloads a finished fold only when checkpoint + exact (pdb_id, mut_code) set match 100%."""
+    if not (os.path.exists(oof_csv_path) and os.path.exists(ckpt_path)):
+        return None
+    try:
+        rows: List[Dict[str, object]] = []
+        with open(oof_csv_path, "r", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows.append({
+                    "fold": int(r["fold"]),
+                    "pdb_id": str(r["pdb_id"]),
+                    "family": str(r["family"]),
+                    "mut_code": str(r["mut_code"]),
+                    "n_muts": int(r["n_muts"]),
+                    "ddg_exp": float(r["ddg_exp"]),
+                    "ddg_pred": float(r["ddg_pred"]),
+                    "dh_phys": float(r["dh_phys"]),
+                    "dh_nn": float(r["dh_nn"]),
+                })
+        expected_keys = {(str(x["pdb_id"]), str(x["mut_code"])) for x in val_items}
+        loaded_keys = {(str(r["pdb_id"]), str(r["mut_code"])) for r in rows}
+        if len(rows) != len(val_items) or loaded_keys != expected_keys:
+            return None
+
+        max_antisym = 0.0
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                for line in mf:
+                    if line.startswith("max_antisym="):
+                        max_antisym = float(line.split("=", 1)[1].strip())
+        return rows, max_antisym
+    except Exception:
+        return None
 
 
 def train_single_fold(
@@ -634,15 +971,16 @@ def train_single_fold(
     dropout_rate: float = 0.15,
     jitter_std: float = 0.02,
     nn_reg_weight: float = 3e-2,
-    patience: int = 6,
+    patience: int = 8,
+    min_epochs: int = 6,
+    sparse_lru: Optional[_SparsePriorLRU] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, Dict[str, jnp.ndarray]], float]:
     """
     Trains one CV fold with all 5 anti-overfitting defenses & joint calibration of 4 physical constants + U_NN.
-    Supports both prior_mode='none' (on-the-fly fallback) and prior_mode='joltz' (real frozen Joltz-1).
+    Uses bit-exact sparse-to-GPU scatter + RAM LRU caching for 8x-12x faster Joltz-1 training.
     """
     use_joltz = (prior_mode == "joltz")
-    if use_joltz:
-        from cancerfold.af2_core.joltz_runner import load_bound_unbound_priors
+    lru = sparse_lru if (sparse_lru is not None) else (_SparsePriorLRU() if use_joltz else None)
 
     key = jax.random.PRNGKey(100 + fold_idx)
     k_init, k_prior_base, k_train = jax.random.split(key, 3)
@@ -681,7 +1019,8 @@ def train_single_fold(
         (s_wt, z_wt), (s_mut, z_mut) = _get_fallback_priors(aa_wt, aa_mut, res_mask)
         theta = _decode_theta(params["phys_raw"])
         return binding_ddg_bar(
-            ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, theta,
+            ens_wt.astype(jnp.float32), ens_mut.astype(jnp.float32),
+            d_ref, phys_wt, phys_mut, w, pa, pb, theta,
             single_wt=s_wt, pair_wt=z_wt, single_mut=s_mut, pair_mut=z_mut,
             single_wt_unbound=s_wt, pair_wt_unbound=z_wt,
             single_mut_unbound=s_mut, pair_mut_unbound=z_mut,
@@ -689,17 +1028,24 @@ def train_single_fold(
         )
 
     @jax.jit
-    def _eval_joltz(
+    def _eval_joltz_sparse(
         params, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk,
-        s_wt_b, z_wt_b, s_mut_b, z_mut_b, s_wt_u, z_wt_u, s_mut_u, z_mut_u,
+        s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
+        s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu,
     ):
+        max_n = s_wb.shape[0]
+        z_wt_b = _scatter_pair_gpu(r_wb, c_wb, z_wb, max_n)
+        z_mut_b = _scatter_pair_gpu(r_mb, c_mb, z_mb, max_n)
+        z_wt_u = _scatter_pair_gpu(r_wu, c_wu, z_wu, max_n)
+        z_mut_u = _scatter_pair_gpu(r_mu, c_mu, z_mu, max_n)
         theta = _decode_theta(params["phys_raw"])
         return binding_ddg_bar(
-            ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, theta,
-            single_wt=s_wt_b.astype(jnp.float32), pair_wt=z_wt_b.astype(jnp.float32),
-            single_mut=s_mut_b.astype(jnp.float32), pair_mut=z_mut_b.astype(jnp.float32),
-            single_wt_unbound=s_wt_u.astype(jnp.float32), pair_wt_unbound=z_wt_u.astype(jnp.float32),
-            single_mut_unbound=s_mut_u.astype(jnp.float32), pair_mut_unbound=z_mut_u.astype(jnp.float32),
+            ens_wt.astype(jnp.float32), ens_mut.astype(jnp.float32),
+            d_ref, phys_wt, phys_mut, w, pa, pb, theta,
+            single_wt=s_wb.astype(jnp.float32), pair_wt=z_wt_b,
+            single_mut=s_mb.astype(jnp.float32), pair_mut=z_mut_b,
+            single_wt_unbound=s_wu.astype(jnp.float32), pair_wt_unbound=z_wt_u,
+            single_mut_unbound=s_mu.astype(jnp.float32), pair_mut_unbound=z_mut_u,
             nn_params=params["nn"], chain_mask=cm, temp_k=tk,
         )
 
@@ -723,14 +1069,16 @@ def train_single_fold(
     @jax.jit
     def _grad_none(params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, aa_wt, aa_mut, cm, tk, y_true):
         k_sub, k_jw, k_jm, k_drop = jax.random.split(step_key, 4)
-        n_frames = ens_wt.shape[0]
+        ew_f32 = ens_wt.astype(jnp.float32)
+        em_f32 = ens_mut.astype(jnp.float32)
+        n_frames = ew_f32.shape[0]
         k_sub_n = max(2, n_frames - 1) if n_frames >= 4 else n_frames
         idx_w = jax.random.choice(k_sub, n_frames, shape=(k_sub_n,), replace=False)
         idx_m = jax.random.choice(k_drop, n_frames, shape=(k_sub_n,), replace=False)
 
         m_bb = res_mask[None, :, None, None]
-        ew = ens_wt[idx_w] + jax.random.normal(k_jw, ens_wt[idx_w].shape, dtype=jnp.float32) * jitter_std * m_bb
-        em = ens_mut[idx_m] + jax.random.normal(k_jm, ens_mut[idx_m].shape, dtype=jnp.float32) * jitter_std * m_bb
+        ew = ew_f32[idx_w] + jax.random.normal(k_jw, ew_f32[idx_w].shape, dtype=jnp.float32) * jitter_std * m_bb
+        em = em_f32[idx_m] + jax.random.normal(k_jm, em_f32[idx_m].shape, dtype=jnp.float32) * jitter_std * m_bb
 
         (s_wt, z_wt), (s_mut, z_mut) = _get_fallback_priors(aa_wt, aa_mut, res_mask)
         keep_prob = 1.0 - dropout_rate
@@ -748,34 +1096,43 @@ def train_single_fold(
         )(params)
 
     @jax.jit
-    def _grad_joltz(
+    def _grad_joltz_sparse(
         params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, cm, tk, y_true,
-        s_wt_b, z_wt_b, s_mut_b, z_mut_b, s_wt_u, z_wt_u, s_mut_u, z_mut_u,
+        s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
+        s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu,
     ):
         k_sub, k_jw, k_jm, k_drop = jax.random.split(step_key, 4)
-        n_frames = ens_wt.shape[0]
+        ew_f32 = ens_wt.astype(jnp.float32)
+        em_f32 = ens_mut.astype(jnp.float32)
+        n_frames = ew_f32.shape[0]
         k_sub_n = max(2, n_frames - 1) if n_frames >= 4 else n_frames
         idx_w = jax.random.choice(k_sub, n_frames, shape=(k_sub_n,), replace=False)
         idx_m = jax.random.choice(k_drop, n_frames, shape=(k_sub_n,), replace=False)
 
         m_bb = res_mask[None, :, None, None]
-        ew = ens_wt[idx_w] + jax.random.normal(k_jw, ens_wt[idx_w].shape, dtype=jnp.float32) * jitter_std * m_bb
-        em = ens_mut[idx_m] + jax.random.normal(k_jm, ens_mut[idx_m].shape, dtype=jnp.float32) * jitter_std * m_bb
+        ew = ew_f32[idx_w] + jax.random.normal(k_jw, ew_f32[idx_w].shape, dtype=jnp.float32) * jitter_std * m_bb
+        em = em_f32[idx_m] + jax.random.normal(k_jm, em_f32[idx_m].shape, dtype=jnp.float32) * jitter_std * m_bb
+
+        max_n = s_wb.shape[0]
+        z_wt_b = _scatter_pair_gpu(r_wb, c_wb, z_wb, max_n)
+        z_mut_b = _scatter_pair_gpu(r_mb, c_mb, z_mb, max_n)
+        z_wt_u = _scatter_pair_gpu(r_wu, c_wu, z_wu, max_n)
+        z_mut_u = _scatter_pair_gpu(r_mu, c_mu, z_mu, max_n)
 
         # Shared symmetric dropout mask preserves exact WT <-> Mut antisymmetry
         keep_prob = 1.0 - dropout_rate
         ks, kz = jax.random.split(k_drop, 2)
-        ms = jax.random.bernoulli(ks, keep_prob, s_wt_b.shape).astype(jnp.float32) / keep_prob
+        ms = jax.random.bernoulli(ks, keep_prob, s_wb.shape).astype(jnp.float32) / keep_prob
         mz = jax.random.bernoulli(kz, keep_prob, z_wt_b.shape).astype(jnp.float32) / keep_prob
 
-        swb = s_wt_b.astype(jnp.float32) * ms
-        smb = s_mut_b.astype(jnp.float32) * ms
-        swu = s_wt_u.astype(jnp.float32) * ms
-        smu = s_mut_u.astype(jnp.float32) * ms
-        zwb = z_wt_b.astype(jnp.float32) * mz
-        zmb = z_mut_b.astype(jnp.float32) * mz
-        zwu = z_wt_u.astype(jnp.float32) * mz
-        zmu = z_mut_u.astype(jnp.float32) * mz
+        swb = s_wb.astype(jnp.float32) * ms
+        smb = s_mb.astype(jnp.float32) * ms
+        swu = s_wu.astype(jnp.float32) * ms
+        smu = s_mu.astype(jnp.float32) * ms
+        zwb = z_wt_b * mz
+        zmb = z_mut_b * mz
+        zwu = z_wt_u * mz
+        zmu = z_mut_u * mz
 
         return jax.value_and_grad(
             lambda p: _loss_core(
@@ -784,26 +1141,17 @@ def train_single_fold(
             )
         )(params)
 
-    def _load_item_joltz(x):
-        jp = x["joltz_paths"]
-        s_wt_b, z_wt_b, s_wt_u, z_wt_u = load_bound_unbound_priors(
-            jp["wt_b"], jp["wt_ua"], jp["wt_ub"], x["idx_a"], x["idx_b"], int(x["max_n"])
-        )
-        s_mut_b, z_mut_b, s_mut_u, z_mut_u = load_bound_unbound_priors(
-            jp["mut_b"], jp["mut_ua"], jp["mut_ub"], x["idx_a"], x["idx_b"], int(x["max_n"])
-        )
-        return s_wt_b, z_wt_b, s_mut_b, z_mut_b, s_wt_u, z_wt_u, s_mut_u, z_mut_u
-
     def _run_eval(params, split_items):
         preds, trues, pdbs, dh_p, dh_n = [], [], [], [], []
+        pending = []
         for x in split_items:
             if use_joltz:
-                s_wb, z_wb, s_mb, z_mb, s_wu, z_wu, s_mu, z_mu = _load_item_joltz(x)
-                out = _eval_joltz(
+                sp = _pack_item_joltz_sparse(x, lru)
+                out = _eval_joltz_sparse(
                     params, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                     x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
                     x["cm"], float(x["temp_k"]),
-                    s_wb, z_wb, s_mb, z_mb, s_wu, z_wu, s_mu, z_mu,
+                    *sp,
                 )
             else:
                 out = _eval_none(
@@ -811,11 +1159,25 @@ def train_single_fold(
                     x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
                     x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]),
                 )
-            preds.append(float(out["ddg_bind"]))
-            trues.append(float(x["ddg_exp"]))
-            pdbs.append(str(x["pdb_id"]))
-            dh_p.append(float(out["dh_phys_mean"]))
-            dh_n.append(float(out["dh_nn_mean"]))
+            pending.append((out["ddg_bind"], out["dh_phys_mean"], out["dh_nn_mean"], float(x["ddg_exp"]), str(x["pdb_id"])))
+            if len(pending) >= 32:
+                vals = jax.device_get([(a, b, c) for a, b, c, _, _ in pending])
+                for (yp, dp, dn), (_, _, _, yt, pid) in zip(vals, pending):
+                    preds.append(float(yp))
+                    dh_p.append(float(dp))
+                    dh_n.append(float(dn))
+                    trues.append(yt)
+                    pdbs.append(pid)
+                pending.clear()
+        if pending:
+            vals = jax.device_get([(a, b, c) for a, b, c, _, _ in pending])
+            for (yp, dp, dn), (_, _, _, yt, pid) in zip(vals, pending):
+                preds.append(float(yp))
+                dh_p.append(float(dp))
+                dh_n.append(float(dn))
+                trues.append(yt)
+                pdbs.append(pid)
+
         m = skempi_metrics(jnp.asarray(preds), jnp.asarray(trues))
         pc_r, pc_rho = _per_complex_stats(preds, trues, pdbs)
         return {
@@ -838,7 +1200,11 @@ def train_single_fold(
     best_epoch = 0
     bad_epochs = 0
 
-    print(f"\n--- [{ckpt_prefix}] Fold {fold_idx} Training ({len(train_items)} train / {len(val_items)} val) ---", flush=True)
+    print(
+        f"\n--- [{ckpt_prefix}] Fold {fold_idx} Training "
+        f"({len(train_items)} train / {len(val_items)} val | min_ep={min_epochs}, patience={patience}) ---",
+        flush=True,
+    )
 
     for ep in range(1, epochs + 1):
         t_ep = time.time()
@@ -849,17 +1215,17 @@ def train_single_fold(
         for b_start in range(0, len(perm), batch_size):
             batch_idx = perm[b_start : b_start + batch_size]
             grad_acc = jax.tree_util.tree_map(jnp.zeros_like, model_params)
-            b_loss = 0.0
+            b_loss = jnp.asarray(0.0, dtype=jnp.float32)
             for idx in batch_idx:
                 x = train_items[int(idx)]
                 k_train, k_step = jax.random.split(k_train)
                 if use_joltz:
-                    s_wb, z_wb, s_mb, z_mb, s_wu, z_wu, s_mu, z_mu = _load_item_joltz(x)
-                    loss_val, grads = _grad_joltz(
+                    sp = _pack_item_joltz_sparse(x, lru)
+                    loss_val, grads = _grad_joltz_sparse(
                         model_params, k_step, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                         x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
                         x["res_mask"], x["cm"], float(x["temp_k"]), jnp.asarray(x["ddg_exp"], jnp.float32),
-                        s_wb, z_wb, s_mb, z_mb, s_wu, z_wu, s_mu, z_mu,
+                        *sp,
                     )
                 else:
                     loss_val, grads = _grad_none(
@@ -869,13 +1235,13 @@ def train_single_fold(
                         jnp.asarray(x["ddg_exp"], jnp.float32),
                     )
                 grad_acc = jax.tree_util.tree_map(lambda a, g: a + g, grad_acc, grads)
-                b_loss += float(loss_val)
+                b_loss = b_loss + loss_val
 
             inv_b = 1.0 / float(len(batch_idx))
             grad_mean = jax.tree_util.tree_map(lambda g: g * inv_b, grad_acc)
             updates, opt_state = optimizer.update(grad_mean, opt_state, model_params)
             model_params = optax.apply_updates(model_params, updates)
-            ep_losses.append(b_loss * inv_b)
+            ep_losses.append(float(b_loss) * inv_b)
 
         val_m = _run_eval(model_params, val_items)
         improved = val_m["rmse"] < (best_rmse - 1e-4)
@@ -884,7 +1250,7 @@ def train_single_fold(
             best_epoch = ep
             bad_epochs = 0
             save_checkpoint(ckpt_path, model_params)
-        else:
+        elif ep >= min_epochs:
             bad_epochs += 1
 
         if ep == 1 or ep % 5 == 0 or improved or ep == epochs:
@@ -904,7 +1270,7 @@ def train_single_fold(
                 flush=True,
             )
 
-        if bad_epochs >= patience:
+        if ep >= min_epochs and bad_epochs >= patience:
             print(
                 f"  [F{fold_idx}] Early stopping at ep {ep} (best ep={best_epoch}, VAL RMSE={best_rmse:.3f})",
                 flush=True,
@@ -924,18 +1290,25 @@ def train_single_fold(
     antisym_errs = []
     for x in val_items[:5]:
         if use_joltz:
-            s_wb, z_wb, s_mb, z_mb, s_wu, z_wu, s_mu, z_mu = _load_item_joltz(x)
-            fwd = _eval_joltz(
+            (
+                s_wb, r_wb, c_wb, z_wb,
+                s_mb, r_mb, c_mb, z_mb,
+                s_wu, r_wu, c_wu, z_wu,
+                s_mu, r_mu, c_mu, z_mu,
+            ) = _pack_item_joltz_sparse(x, lru)
+            fwd = _eval_joltz_sparse(
                 reloaded, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                 x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
                 x["cm"], float(x["temp_k"]),
-                s_wb, z_wb, s_mb, z_mb, s_wu, z_wu, s_mu, z_mu,
+                s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
+                s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu,
             )["ddg_bind"]
-            rev = _eval_joltz(
+            rev = _eval_joltz_sparse(
                 reloaded, x["ens_mut"], x["ens_wt"], x["d_ref_ca"],
                 x["phys_mut"], x["phys_wt"], x["weights"], x["pa_mask"], x["pb_mask"],
                 x["cm"], float(x["temp_k"]),
-                s_mb, z_mb, s_wb, z_wb, s_mu, z_mu, s_wu, z_wu,
+                s_mb, r_mb, c_mb, z_mb, s_wb, r_wb, c_wb, z_wb,
+                s_mu, r_mu, c_mu, z_mu, s_wu, r_wu, c_wu, z_wu,
             )["ddg_bind"]
         else:
             fwd = _eval_none(
@@ -1058,13 +1431,70 @@ def summarize_benchmark_pillars(
     }
 
 
-def _save_oof_csv(path: str, rows: List[Dict[str, object]]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fields = ["fold", "pdb_id", "family", "mut_code", "n_muts", "ddg_exp", "ddg_pred", "dh_phys", "dh_nn"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
+def _run_cv_suite(
+    folds: List[Tuple[List[Dict[str, object]], List[Dict[str, object]]]],
+    weights_dir: str,
+    prior_mode: str,
+    ckpt_prefix: str,
+    mode: str,
+    epochs: int,
+    batch_size: int,
+    patience: int,
+    min_epochs: int,
+    resume_folds: bool,
+    drive_weights_dir: str,
+) -> Tuple[List[Dict[str, object]], float]:
+    all_oof: List[Dict[str, object]] = []
+    max_antisym = 0.0
+    sparse_lru = _SparsePriorLRU() if prior_mode == "joltz" else None
+    if sparse_lru is not None:
+        print(
+            f"[CACHE] Sparse Joltz-1 RAM LRU budget = {sparse_lru.max_bytes / (1024 ** 3):.1f} GB "
+            f"(bit-exact GPU scatter active)",
+            flush=True,
+        )
+
+    for k, (tr_items, va_items) in enumerate(folds):
+        ckpt_path = os.path.join(weights_dir, f"{ckpt_prefix}_fold{k}.npz")
+        fold_oof_path = os.path.join(weights_dir, f"{ckpt_prefix}_fold{k}_oof.csv")
+        fold_meta_path = os.path.join(weights_dir, f"{ckpt_prefix}_fold{k}_meta.txt")
+
+        resumed = None
+        if resume_folds:
+            resumed = _load_fold_oof_if_valid(fold_oof_path, ckpt_path, fold_meta_path, va_items)
+
+        if resumed is not None:
+            oof_k, asym_k = resumed
+            print(
+                f"  [F{k} RESUME] Verified & loaded finished {ckpt_prefix}_fold{k} "
+                f"({len(oof_k)} val muts, BAR={asym_k:.2e})",
+                flush=True,
+            )
+        else:
+            oof_k, _, asym_k = train_single_fold(
+                fold_idx=k, train_items=tr_items, val_items=va_items,
+                weights_dir=weights_dir, prior_mode=prior_mode, ckpt_prefix=ckpt_prefix,
+                epochs=epochs, batch_size=batch_size,
+                patience=patience, min_epochs=min_epochs,
+                sparse_lru=sparse_lru,
+            )
+            _save_oof_csv(fold_oof_path, oof_k)
+            with open(fold_meta_path, "w", encoding="utf-8") as mf:
+                mf.write(f"mode={mode}\nfold={k}\nn_val={len(oof_k)}\nmax_antisym={asym_k:.6e}\n")
+            if drive_weights_dir:
+                _sync_file_to_drive(ckpt_path, os.path.join(drive_weights_dir, os.path.basename(ckpt_path)))
+                _sync_file_to_drive(fold_oof_path, os.path.join(drive_weights_dir, os.path.basename(fold_oof_path)))
+                _sync_file_to_drive(fold_meta_path, os.path.join(drive_weights_dir, os.path.basename(fold_meta_path)))
+                print(f"  [DRIVE] Backed up {ckpt_prefix}_fold{k} checkpoint + OOF to {drive_weights_dir}", flush=True)
+
+        all_oof.extend(oof_k)
+        max_antisym = max(max_antisym, asym_k)
+
+    if sparse_lru is not None:
+        sparse_lru.clear()
+    gc.collect()
+    jax.clear_caches()
+    return all_oof, max_antisym
 
 
 def run_skempi_cv(
@@ -1075,6 +1505,10 @@ def run_skempi_cv(
     weights_dir: str = "/content/oncovac_weights",
     recycling_steps: int = 1,
     use_msa: bool = False,
+    patience: int = 8,
+    min_epochs: int = 6,
+    drive_backup_dir: str = "",
+    resume_folds: bool = False,
 ) -> None:
     presets = {
         "mini": dict(max_n=384, max_complexes=12, max_per_pdb=8, epochs=20, batch_size=8),
@@ -1082,9 +1516,11 @@ def run_skempi_cv(
         "full": dict(max_n=512, max_complexes=400, max_per_pdb=100, epochs=30, batch_size=16),
     }
     cfg = presets[mode]
+    drive_weights_dir = os.path.join(drive_backup_dir, f"weights_{mode}") if drive_backup_dir else ""
     print(
         f"=== OncoVac-Adenine Gen 1 | 3-Fold Family-Disjoint SKEMPI 2.0 "
-        f"(mode={mode.upper()}, prior={prior}, msa={use_msa}, rec={recycling_steps}) ===",
+        f"(mode={mode.upper()}, prior={prior}, msa={use_msa}, rec={recycling_steps}, "
+        f"min_ep={min_epochs}, patience={patience}, resume={resume_folds}) ===",
         flush=True,
     )
     records = load_skempi_records(
@@ -1093,7 +1529,17 @@ def run_skempi_cv(
         max_complexes=cfg["max_complexes"],
         max_per_pdb=cfg["max_per_pdb"],
     )
-    items = prepare_cached_ensembles(records, jax.random.PRNGKey(42), cache_dir=cache_dir)
+    if drive_backup_dir:
+        _sync_file_to_drive(
+            os.path.join(cache_dir, "skempi_v2.csv"),
+            os.path.join(drive_backup_dir, "oncovac_cache", "skempi_v2.csv"),
+        )
+        dst_pdbs = os.path.join(drive_backup_dir, "oncovac_cache", "pdbs")
+        _sync_dir_incremental(os.path.join(cache_dir, "pdbs"), dst_pdbs, _init_synced_index(dst_pdbs))
+
+    items = prepare_cached_ensembles(
+        records, jax.random.PRNGKey(42), cache_dir=cache_dir, drive_backup_dir=drive_backup_dir
+    )
 
     if prior in ("joltz", "both"):
         items = prepare_joltz_priors_cache(
@@ -1102,6 +1548,7 @@ def run_skempi_cv(
             cache_dir=cache_dir,
             recycling_steps=recycling_steps,
             use_msa=use_msa,
+            drive_backup_dir=drive_backup_dir,
         )
 
     folds = make_family_disjoint_folds(items, n_folds=3)
@@ -1110,40 +1557,41 @@ def run_skempi_cv(
 
     # 1. Zero-Shot Raw Analytical Physics (no AI)
     zs_rows = _evaluate_zero_shot_hphys(items)
-    _save_oof_csv(os.path.join(weights_dir, f"oof_zeroshot_hphys_{mode}.csv"), zs_rows)
+    zs_csv = os.path.join(weights_dir, f"oof_zeroshot_hphys_{mode}.csv")
+    _save_oof_csv(zs_csv, zs_rows)
+    if drive_weights_dir:
+        _sync_file_to_drive(zs_csv, os.path.join(drive_weights_dir, os.path.basename(zs_csv)))
     summary_rows.append(("Zero-Shot H_phys (Raw)", summarize_benchmark_pillars("Zero-Shot H_phys (Raw)", zs_rows)))
 
-    # 2. Standalone Ablation (Adenine without Joltz-1)
+    # 2. Standalone Release Model (OncoVac Adenine Lite — No-Joltz)
     if prior in ("none", "both"):
-        all_oof_none, antisym_none = [], 0.0
-        for k, (tr_items, va_items) in enumerate(folds):
-            oof_k, _, asym_k = train_single_fold(
-                fold_idx=k, train_items=tr_items, val_items=va_items,
-                weights_dir=weights_dir, prior_mode="none", ckpt_prefix="adenine_nojoltz",
-                epochs=cfg["epochs"], batch_size=cfg["batch_size"],
-            )
-            all_oof_none.extend(oof_k)
-            antisym_none = max(antisym_none, asym_k)
-        _save_oof_csv(os.path.join(weights_dir, f"oof_adenine_nojoltz_{mode}.csv"), all_oof_none)
+        all_oof_none, antisym_none = _run_cv_suite(
+            folds=folds, weights_dir=weights_dir, prior_mode="none", ckpt_prefix="adenine_nojoltz",
+            mode=mode, epochs=cfg["epochs"], batch_size=cfg["batch_size"],
+            patience=patience, min_epochs=min_epochs,
+            resume_folds=resume_folds, drive_weights_dir=drive_weights_dir,
+        )
+        none_csv = os.path.join(weights_dir, f"oof_adenine_nojoltz_{mode}.csv")
+        _save_oof_csv(none_csv, all_oof_none)
+        if drive_weights_dir:
+            _sync_file_to_drive(none_csv, os.path.join(drive_weights_dir, os.path.basename(none_csv)))
         summary_rows.append((
-            "Adenine (No-Joltz)",
-            summarize_benchmark_pillars("Adenine (No-Joltz)", all_oof_none, max_antisym=antisym_none),
+            "Adenine Lite (No-Joltz)",
+            summarize_benchmark_pillars("Adenine Lite (No-Joltz)", all_oof_none, max_antisym=antisym_none),
         ))
-        gc.collect()
-        jax.clear_caches()
 
     # 3. Flagship Release Model (OncoVac Adenine Gen 1 + Frozen Joltz-1)
     if prior in ("joltz", "both"):
-        all_oof_joltz, antisym_joltz = [], 0.0
-        for k, (tr_items, va_items) in enumerate(folds):
-            oof_k, _, asym_k = train_single_fold(
-                fold_idx=k, train_items=tr_items, val_items=va_items,
-                weights_dir=weights_dir, prior_mode="joltz", ckpt_prefix="adenine_gen1",
-                epochs=cfg["epochs"], batch_size=cfg["batch_size"],
-            )
-            all_oof_joltz.extend(oof_k)
-            antisym_joltz = max(antisym_joltz, asym_k)
-        _save_oof_csv(os.path.join(weights_dir, f"oof_adenine_gen1_{mode}.csv"), all_oof_joltz)
+        all_oof_joltz, antisym_joltz = _run_cv_suite(
+            folds=folds, weights_dir=weights_dir, prior_mode="joltz", ckpt_prefix="adenine_gen1",
+            mode=mode, epochs=cfg["epochs"], batch_size=cfg["batch_size"],
+            patience=patience, min_epochs=min_epochs,
+            resume_folds=resume_folds, drive_weights_dir=drive_weights_dir,
+        )
+        gen1_csv = os.path.join(weights_dir, f"oof_adenine_gen1_{mode}.csv")
+        _save_oof_csv(gen1_csv, all_oof_joltz)
+        if drive_weights_dir:
+            _sync_file_to_drive(gen1_csv, os.path.join(drive_weights_dir, os.path.basename(gen1_csv)))
         summary_rows.append((
             "OncoVac Adenine Gen 1 (+Joltz-1)",
             summarize_benchmark_pillars("OncoVac Adenine Gen 1 (+Joltz-1)", all_oof_joltz, max_antisym=antisym_joltz),
@@ -1171,6 +1619,10 @@ if __name__ == "__main__":
     parser.add_argument("--cache-dir", default="/content/oncovac_cache")
     parser.add_argument("--boltz-cache-dir", default="/content/boltz_cache")
     parser.add_argument("--weights-dir", default="/content/oncovac_weights")
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--min-epochs", type=int, default=6)
+    parser.add_argument("--drive-backup-dir", default="", help="Optional Drive dir for periodic cache/fold backups")
+    parser.add_argument("--resume-folds", action="store_true", help="Safely skip verified finished folds on restart")
     args = parser.parse_args()
     run_skempi_cv(
         mode=args.mode,
@@ -1180,4 +1632,8 @@ if __name__ == "__main__":
         weights_dir=args.weights_dir,
         recycling_steps=args.recycling_steps,
         use_msa=args.use_msa,
+        patience=args.patience,
+        min_epochs=args.min_epochs,
+        drive_backup_dir=args.drive_backup_dir,
+        resume_folds=args.resume_folds,
     )
