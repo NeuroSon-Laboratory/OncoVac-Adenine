@@ -168,7 +168,7 @@ def single_state_nn_energy(
     """
     Pure state function U_NN(X; s_alpha, z_alpha, phys_alpha, chain_mask) with Effective-Hamiltonian localization:
       - Dedicated 8-dim local biochemical + live total/interface burial + pocket branch
-      - Explicit inter-chain binding interface indicator (strictly 0 in single-chain unbound -> zero telepathy)
+      - Explicit inter-chain binding interface indicator from 1D chain_mask (strictly 0 in single-chain unbound)
       - Smooth RMS-balanced frozen Joltz-1 (s, z) so global Pairformer channels never drown 3D geometry
       - Dual-Cutoff (10 A short contact / 16 A long dielectric) + 7 SE(3) orientation scalars
       - 2-hop conservative message passing for 3-body many-body cooperativity
@@ -179,8 +179,12 @@ def single_state_nn_energy(
     pair_valid = (m[:, None] * m[None, :]) * (1.0 - jnp.eye(n, dtype=jnp.float32))
 
     if chain_mask is not None:
-        cm_f = jnp.clip(chain_mask[:n, :n].astype(jnp.float32), 0.0, 1.0)
-        is_inter = (1.0 - cm_f) * pair_valid
+        if chain_mask.ndim == 1:
+            cid = chain_mask[:n]
+            same_chain = ((cid[:, None] == cid[None, :]) & (cid[:, None] >= 0)).astype(jnp.float32)
+        else:
+            same_chain = jnp.clip(chain_mask[:n, :n].astype(jnp.float32), 0.0, 1.0)
+        is_inter = (1.0 - same_chain) * pair_valid
     else:
         is_inter = jnp.zeros((n, n), dtype=jnp.float32)
 
@@ -345,7 +349,6 @@ def full_state_energy_and_force(
         theta,
         chain_mask=chain_mask,
         use_adaptive_dielectric=use_adaptive_dielectric,
-        max_force=max_force,
     )
 
     if nn_params is None:
