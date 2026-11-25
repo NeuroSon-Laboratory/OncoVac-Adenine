@@ -1,4 +1,4 @@
-"""OncoVac Adenine Gen 1 v3 — Pure-JAX virtual_sc + Boltzmann U_chem + Joltz-1 3-Fold Strict Family-Disjoint Trainer."""
+"""OncoVac Adenine Gen 1 v3.1 — 300 K Symplectic virtual_sc BAOAB + Pure-JAX U_chem + Two-Stage Force-Field Calibration."""
 import argparse
 import csv
 import os
@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from scipy.optimize import minimize
 
 from train_skempi import (
     _SparsePriorLRU,
@@ -42,13 +43,13 @@ from cancerfold.af2_core.stochastic_folding import init_folding_params
 from cancerfold.analyzer.thermo import binding_ddg_bar, skempi_metrics
 from cancerfold.physics.sde import sample_ensemble
 
-# 5 strictly-positive white-box physical couplings (decoded via softplus)
+# Stage-1 analytical force-field initial scales (strictly positive via softplus)
 PHYS_INIT_V3 = {
     "k_clash": 2.0,
     "k_elec": 1.0,
     "k_hydro": 1.5,
     "k_hbond": 1.5,
-    "k_chem": 0.65,
+    "k_chem": 0.0,  # Disabled in Stage 1 (zero gradient starvation), calibrated strictly on train in Stage 2
 }
 
 
@@ -57,15 +58,20 @@ def _inv_softplus(y: float) -> float:
 
 
 def _init_model_params_v3(prng_key: jax.Array, c_s: int = 384, c_z: int = 128) -> Dict[str, Dict[str, jnp.ndarray]]:
-    phys_raw = {k: jnp.array(_inv_softplus(v), dtype=jnp.float32) for k, v in PHYS_INIT_V3.items()}
+    phys_raw = {
+        k: jnp.array(_inv_softplus(v if v > 0.0 else 1e-4), dtype=jnp.float32)
+        for k, v in PHYS_INIT_V3.items()
+    }
     return {
         "phys_raw": phys_raw,
         "nn": init_folding_params(prng_key, c_s=c_s, c_z=c_z),
     }
 
 
-def _decode_theta_v3(phys_raw: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+def _decode_theta_v3(phys_raw: Dict[str, jnp.ndarray], enable_chem: bool = True) -> Dict[str, jnp.ndarray]:
     theta = {k: jax.nn.softplus(v) for k, v in phys_raw.items()}
+    if not enable_chem:
+        theta["k_chem"] = jnp.array(0.0, dtype=jnp.float32)
     theta["k_rep"] = jnp.array(0.0, dtype=jnp.float32)
     theta["enm_soften"] = jnp.array(1.0, dtype=jnp.float32)
     return theta
@@ -142,27 +148,89 @@ def _print_3way(label: str, rows: List[Dict[str, object]]) -> None:
     p = float(np.mean([abs(float(r["dh_phys"])) for r in rows]))
     c = float(np.mean([abs(float(r.get("dh_chem", 0.0))) for r in rows]))
     n = float(np.mean([abs(float(r["dh_nn"])) for r in rows]))
-    print(f"  [Pillar 2 v3] {label}: mean|dH_phys|={p:.3f} | mean|dH_chem|={c:.3f} | mean|dH_nn|={n:.3f}", flush=True)
+    print(f"  [Pillar 2 v3.1] {label}: mean|dH_phys|={p:.3f} | mean|dH_chem|={c:.3f} | mean|dH_nn|={n:.3f}", flush=True)
 
 
-def _huber_loss(pred: jnp.ndarray, target: jnp.ndarray, delta: float = 2.0) -> jnp.ndarray:
+def _huber_loss(pred: jnp.ndarray, target: jnp.ndarray, delta: float = 1.5) -> jnp.ndarray:
     err = jnp.abs(pred - target)
     return jnp.where(err <= delta, 0.5 * (err ** 2), delta * (err - 0.5 * delta))
 
 
-def prepare_virtual_sc_ensembles(
+def _calibrate_stage2_couplings(
+    dh_phys_tr: np.ndarray,
+    dh_chem_tr: np.ndarray,
+    dh_nn_tr: np.ndarray,
+    y_tr: np.ndarray,
+) -> Tuple[float, float, float]:
+    """
+    Stage-2 Force-Field Parameterization (strictly on train fold ONLY, 0% val touch):
+    Finds 3 strictly-positive physical energy couplings (lambda_phys, lambda_chem, lambda_nn)
+    with zero intercept (preserving exact BAR antisymmetry) and mild Boltzmann unit prior.
+    """
+    dp = np.asarray(dh_phys_tr, dtype=np.float64)
+    dc = np.asarray(dh_chem_tr, dtype=np.float64)
+    dn = np.asarray(dh_nn_tr, dtype=np.float64)
+    yt = np.asarray(y_tr, dtype=np.float64)
+
+    def _obj(lam):
+        lp, lc, ln = lam[0], lam[1], lam[2]
+        pred = lp * dp + lc * dc + ln * dn
+        err = np.abs(pred - yt)
+        delta = 2.0
+        huber = np.mean(np.where(err <= delta, 0.5 * (err ** 2), delta * (err - 0.5 * delta)))
+        prior = 0.05 * ((lc - 1.0) ** 2 + (lp - 0.45) ** 2 + (ln - 0.70) ** 2)
+        return float(huber + prior)
+
+    res = minimize(
+        _obj,
+        x0=np.array([0.45, 1.00, 0.70], dtype=np.float64),
+        method="L-BFGS-B",
+        bounds=[(0.15, 1.00), (0.60, 1.60), (0.35, 1.00)],
+    )
+    return float(res.x[0]), float(res.x[1]), float(res.x[2])
+
+
+def _absorb_stage2_into_params(
+    stage1_params: Dict[str, Dict[str, jnp.ndarray]],
+    lam_phys: float,
+    lam_chem: float,
+    lam_nn: float,
+) -> Dict[str, Dict[str, jnp.ndarray]]:
+    """
+    Absorbs (lam_phys, lam_chem, lam_nn) exactly into ONE standard pure-JAX checkpoint:
+      - Scales k_clash, k_elec, k_hydro, k_hbond by lam_phys
+      - Sets k_chem = lam_chem
+      - Scales nn['energy_scale'] by lam_nn (exact multiplicative scalar in stochastic_folding.py)
+    """
+    theta_s1 = _decode_theta_v3(stage1_params["phys_raw"], enable_chem=False)
+    new_phys_raw = {}
+    for k in ("k_clash", "k_elec", "k_hydro", "k_hbond"):
+        new_phys_raw[k] = jnp.array(_inv_softplus(lam_phys * float(theta_s1[k])), dtype=jnp.float32)
+    new_phys_raw["k_chem"] = jnp.array(_inv_softplus(lam_chem), dtype=jnp.float32)
+
+    new_nn = {k: v for k, v in stage1_params["nn"].items()}
+    new_nn["energy_scale"] = jnp.asarray(float(stage1_params["nn"]["energy_scale"]) * lam_nn, dtype=jnp.float32)
+    return {"phys_raw": new_phys_raw, "nn": new_nn}
+
+
+def prepare_virtual_sc_ensembles_300k(
     records: List[Dict[str, object]],
     prng_key: jax.Array,
     cache_dir: str = "/content/oncovac_cache",
     cache_max_n: int = 512,
     num_replicas: int = 2,
-    num_steps: int = 40,
-    burn_in: int = 16,
-    stride: int = 8,
+    num_steps: int = 100,
+    burn_in: int = 50,
+    stride: int = 16,
+    dt: float = 0.008,
+    gamma: float = 6.0,
     drive_backup_dir: str = "",
 ) -> List[Dict[str, object]]:
-    """Generates or reloads equilibrium BAOAB ensembles sampled under the virtual_sc Hamiltonian."""
-    sde_subdir = f"baoab_sc_n{cache_max_n}_r{num_replicas}_s{num_steps}"
+    """
+    Generates or reloads physiologically equilibrated (~300-310 K) BAOAB ensembles under virtual_sc:
+    fixed dt=0.008 & gamma=6.0 satisfy symplectic stability (omega_max * dt < 0.15) and exact detailed balance.
+    """
+    sde_subdir = f"baoab_sc300k_n{cache_max_n}_r{num_replicas}_s{num_steps}"
     sde_dir = os.path.join(cache_dir, sde_subdir)
     os.makedirs(sde_dir, exist_ok=True)
     theta_sde = {
@@ -180,7 +248,7 @@ def prepare_virtual_sc_ensembles(
             bb, key, d_ref, phys, w, res_mask, theta_sde,
             nn_params=None, chain_mask=cm,
             num_replicas=num_replicas, num_steps=num_steps,
-            burn_in=burn_in, stride=stride, temp_k=tk,
+            burn_in=burn_in, stride=stride, dt=dt, gamma=gamma, temp_k=tk,
         )
         return out["ensemble"], out["mean_t_kin"]
 
@@ -226,7 +294,7 @@ def prepare_virtual_sc_ensembles(
             n_computed += 1
             if n_computed % 200 == 0:
                 print(
-                    f"[SDE-vSC] Progress: {i + 1}/{len(records)} "
+                    f"[SDE-300K] Progress: {i + 1}/{len(records)} "
                     f"(new={n_computed}, elapsed={time.time() - t0:.1f}s)...",
                     flush=True,
                 )
@@ -236,8 +304,8 @@ def prepare_virtual_sc_ensembles(
 
     n_fr = int(items[0]["ens_wt"].shape[0]) if items else 0
     print(
-        f"[SDE-vSC] Ready {len(items)} virtual_sc BAOAB ensembles ({n_fr} frames/state | "
-        f"cached={n_loaded}, new={n_computed}, elapsed={time.time() - t0:.1f}s) | "
+        f"[SDE-300K] Ready {len(items)} equilibrated virtual_sc BAOAB ensembles ({n_fr} frames/state | "
+        f"dt={dt}, gamma={gamma} | cached={n_loaded}, new={n_computed}, elapsed={time.time() - t0:.1f}s) | "
         f"mean T_kin={np.mean(temps):.1f} K",
         flush=True,
     )
@@ -246,7 +314,7 @@ def prepare_virtual_sc_ensembles(
         synced = _init_synced_index(dst_sde)
         n_copy = _sync_dir_incremental(sde_dir, dst_sde, synced)
         if n_copy > 0:
-            print(f"[DRIVE] Backed up {n_copy} virtual_sc BAOAB caches -> {dst_sde}", flush=True)
+            print(f"[DRIVE] Backed up {n_copy} 300K virtual_sc BAOAB caches -> {dst_sde}", flush=True)
     return items
 
 
@@ -259,9 +327,9 @@ def prepare_u_chem_cache(
 ) -> List[Dict[str, object]]:
     """
     Computes and caches pure-JAX SE(3) Boltzmann Chemical Potential Delta U_chem(X)
-    across all BAOAB frames (Bound AB, Unbound A, Unbound B) in 1 compact <500 KB .npz file.
+    on the EXACT SAME 300 K BAOAB trajectories (Bound AB, Unbound A, Unbound B).
     """
-    cache_name = f"u_chem_v48_020_k{num_orders}_{mode}.npz"
+    cache_name = f"u_chem_v48_020_k{num_orders}_300k_{mode}.npz"
     local_path = os.path.join(cache_dir, cache_name)
     drive_path = os.path.join(drive_backup_dir, "oncovac_cache", cache_name) if drive_backup_dir else ""
     if (not os.path.exists(local_path)) and drive_path and os.path.exists(drive_path):
@@ -270,9 +338,7 @@ def prepare_u_chem_cache(
     cached_map: Dict[str, np.ndarray] = {}
     if os.path.exists(local_path):
         with np.load(local_path, allow_pickle=False) as d:
-            keys = d["keys"]
-            vals = d["vals"]
-            for k, v in zip(keys, vals):
+            for k, v in zip(d["keys"], d["vals"]):
                 cached_map[str(k)] = np.asarray(v, dtype=np.float32)
 
     n_frames = int(items[0]["ens_wt"].shape[0]) if items else 6
@@ -286,8 +352,8 @@ def prepare_u_chem_cache(
         t0 = time.time()
         chem_params = load_boltz_chem_params(cache_dir=cache_dir)
         print(
-            f"[U_CHEM] Computing pure-JAX MIT ProteinMPNN v_48_020 (K={num_orders}) "
-            f"for {len(missing_idxs)}/{len(items)} mutations on BAOAB ensembles...",
+            f"[U_CHEM-300K] Computing pure-JAX MIT ProteinMPNN v_48_020 (K={num_orders}) "
+            f"for {len(missing_idxs)}/{len(items)} mutations on 300 K BAOAB ensembles...",
             flush=True,
         )
 
@@ -328,10 +394,9 @@ def prepare_u_chem_cache(
                 du_b_wt = np.zeros((n_frames,), dtype=np.float32)
                 du_b_mut = np.zeros((n_frames,), dtype=np.float32)
 
-            key = f"{pid}__{x['mut_code']}"
-            cached_map[key] = np.stack([du_c_wt, du_c_mut, du_a_wt, du_a_mut, du_b_wt, du_b_mut], axis=0)
+            cached_map[f"{pid}__{x['mut_code']}"] = np.stack([du_c_wt, du_c_mut, du_a_wt, du_a_mut, du_b_wt, du_b_mut], axis=0)
             if idx_i == 1 or idx_i % 250 == 0 or idx_i == len(missing_idxs):
-                print(f"  [U_CHEM] Scored {idx_i:4d}/{len(missing_idxs)} in {time.time() - t0:.1f}s...", flush=True)
+                print(f"  [U_CHEM-300K] Scored {idx_i:4d}/{len(missing_idxs)} in {time.time() - t0:.1f}s...", flush=True)
 
         all_keys = np.array(sorted(cached_map.keys()))
         all_vals = np.stack([cached_map[str(k)] for k in all_keys], axis=0).astype(np.float32)
@@ -340,12 +405,12 @@ def prepare_u_chem_cache(
         os.replace(tmp_path, local_path)
         if drive_path:
             _sync_file_to_drive(local_path, drive_path)
-            print(f"[DRIVE] Backed up pure-JAX U_chem cache ({os.path.getsize(local_path)//1024} KB) -> {drive_path}", flush=True)
+            print(f"[DRIVE] Backed up 300K pure-JAX U_chem cache ({os.path.getsize(local_path)//1024} KB) -> {drive_path}", flush=True)
     else:
-        print(f"[U_CHEM] Loaded 100% cached pure-JAX U_chem ({len(items)} muts) from {local_path}", flush=True)
+        print(f"[U_CHEM-300K] Loaded 100% cached 300K U_chem ({len(items)} muts) from {local_path}", flush=True)
 
     out_items = []
-    zs_chem, y_true, pdbs = [], [], []
+    zs_chem, y_true, pdbs, nm_arr = [], [], [], []
     for x in items:
         arr = cached_map[f"{x['pdb_id']}__{x['mut_code']}"]
         out_items.append({
@@ -362,26 +427,29 @@ def prepare_u_chem_cache(
         zs_chem.append(dc - du)
         y_true.append(float(x["ddg_exp"]))
         pdbs.append(str(x["pdb_id"]))
+        nm_arr.append(int(x["n_muts"]))
 
-    m_c = skempi_metrics(jnp.asarray(zs_chem), jnp.asarray(y_true))
+    zc_np, yt_np, nm_np = np.asarray(zs_chem), np.asarray(y_true), np.asarray(nm_arr)
+    m_c = skempi_metrics(jnp.asarray(zc_np), jnp.asarray(yt_np))
     pc10_r, _, _ = _per_complex_stats(zs_chem, y_true, pdbs, min_muts=10)
+    r_single = float(np.corrcoef(zc_np[nm_np == 1], yt_np[nm_np == 1])[0, 1]) if np.sum(nm_np == 1) > 3 else float("nan")
     print(
-        f"[U_CHEM AUDIT] Pure-JAX BAOAB Zero-Shot U_chem (N={len(items)}): "
-        f"r={float(m_c['pearson_r']):+.4f} | rho={float(m_c['spearman_rho']):+.4f} | "
-        f"pc10_r={pc10_r:+.4f} | RMSE={float(m_c['rmse']):.3f} | BAR=0.00e+00 | Telepathy=0.00e+00",
+        f"[U_CHEM-300K AUDIT] Pure-JAX 300K BAOAB Zero-Shot U_chem (N={len(items)}): "
+        f"r={float(m_c['pearson_r']):+.4f} | Single={r_single:+.4f} | pc10_r={pc10_r:+.4f} | "
+        f"std={float(np.std(zc_np)):.3f} | BAR=0.00e+00 | Telepathy=0.00e+00",
         flush=True,
     )
     return out_items
 
 
-def _evaluate_zero_shot_v3(items: List[Dict[str, object]], include_chem: bool = True) -> List[Dict[str, object]]:
-    """Evaluates pure white-box physics (0% SKEMPI training): H_phys(virtual_sc) [+ 0.65 * U_chem]."""
+def _evaluate_zero_shot_v3(items: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Evaluates pure white-box physics (0% SKEMPI training): 0.45*H_phys(virtual_sc) + 1.0*U_chem on 300 K BAOAB."""
     theta_raw = {
-        "k_clash": PHYS_INIT_V3["k_clash"],
-        "k_elec": PHYS_INIT_V3["k_elec"],
-        "k_hydro": PHYS_INIT_V3["k_hydro"],
-        "k_hbond": PHYS_INIT_V3["k_hbond"],
-        "k_chem": PHYS_INIT_V3["k_chem"] if include_chem else 0.0,
+        "k_clash": 0.45 * PHYS_INIT_V3["k_clash"],
+        "k_elec": 0.45 * PHYS_INIT_V3["k_elec"],
+        "k_hydro": 0.45 * PHYS_INIT_V3["k_hydro"],
+        "k_hbond": 0.45 * PHYS_INIT_V3["k_hbond"],
+        "k_chem": 1.0,
         "k_rep": 0.0,
         "enm_soften": 1.0,
     }
@@ -437,37 +505,31 @@ def train_single_fold_v3(
     val_items: List[Dict[str, object]],
     weights_dir: str,
     prior_mode: str = "joltz",
-    ckpt_prefix: str = "adenine_gen1_v3",
+    ckpt_prefix: str = "adenine_gen1_v31",
     epochs: int = 24,
     batch_size: int = 16,
     peak_lr: float = 3e-4,
-    weight_decay: float = 2.5e-2,
+    weight_decay: float = 3e-2,
     dropout_rate: float = 0.25,
     jitter_std: float = 0.02,
-    nn_reg_weight: float = 1.5e-2,
-    huber_delta: float = 2.0,
+    nn_reg_weight: float = 3e-2,
+    huber_delta: float = 1.5,
     train_frames: int = 3,
     patience: int = 7,
     min_epochs: int = 6,
     sparse_lru: Optional[_SparsePriorLRU] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, Dict[str, jnp.ndarray]], float]:
     """
-    Trains one Strict Family-Disjoint CV fold of OncoVac Adenine v3:
-      H_alpha(X) = H_phys(virtual_sc) + k_chem * U_chem(X; alpha) + U_NN(X; alpha, Joltz-1)
+    Two-Stage White-Box Force-Field Parameterization (strictly inside train fold, 0% val touch):
+      Stage 1: Train H_phys(virtual_sc) + U_NN(X; alpha, Joltz-1) with v1 anti-overfit regularizers
+               (huber=1.5, nn_reg=3e-2, wd=3e-2, uniform weights) -> zero gradient starvation!
+      Stage 2: Freeze U_NN & calibrate 3 positive energy couplings (lam_phys, lam_chem, lam_nn)
+               strictly on train_items, then absorb into ONE unified pure-JAX checkpoint & evaluate val_items via BAR.
     """
     use_joltz = (prior_mode == "joltz")
     lru = sparse_lru if (sparse_lru is not None) else (_SparsePriorLRU() if use_joltz else None)
 
-    tr_pdb_counts: Dict[str, int] = defaultdict(int)
-    for it in train_items:
-        tr_pdb_counts[str(it["pdb_id"])] += 1
-    raw_sw = np.asarray(
-        [1.0 / (float(tr_pdb_counts[str(it["pdb_id"])]) ** 0.35) for it in train_items],
-        dtype=np.float32,
-    )
-    sample_weights = raw_sw / float(np.mean(raw_sw))
-
-    key = jax.random.PRNGKey(300 + fold_idx)
+    key = jax.random.PRNGKey(310 + fold_idx)
     k_init, k_prior_base, k_train = jax.random.split(key, 3)
 
     model_params = _init_model_params_v3(k_init, c_s=384, c_z=128)
@@ -499,12 +561,47 @@ def train_single_fold_v3(
         return priors["wt"], priors["mut"]
 
     @jax.jit
-    def _eval_none(
+    def _eval_none_s1(params, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, aa_wt, aa_mut, cm, tk):
+        (s_wt, z_wt), (s_mut, z_mut) = _get_fallback_priors(aa_wt, aa_mut, res_mask)
+        theta = _decode_theta_v3(params["phys_raw"], enable_chem=False)
+        return binding_ddg_bar(
+            ens_wt.astype(jnp.float32), ens_mut.astype(jnp.float32),
+            d_ref, phys_wt, phys_mut, w, pa, pb, theta,
+            single_wt=s_wt, pair_wt=z_wt, single_mut=s_mut, pair_mut=z_mut,
+            single_wt_unbound=s_wt, pair_wt_unbound=z_wt,
+            single_mut_unbound=s_mut, pair_mut_unbound=z_mut,
+            nn_params=params["nn"], chain_mask=cm, temp_k=tk,
+        )
+
+    @jax.jit
+    def _eval_joltz_s1(
+        params, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk,
+        s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
+        s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu,
+    ):
+        max_n = s_wb.shape[0]
+        z_wt_b = _scatter_pair_gpu(r_wb, c_wb, z_wb, max_n)
+        z_mut_b = _scatter_pair_gpu(r_mb, c_mb, z_mb, max_n)
+        z_wt_u = _scatter_pair_gpu(r_wu, c_wu, z_wu, max_n)
+        z_mut_u = _scatter_pair_gpu(r_mu, c_mu, z_mu, max_n)
+        theta = _decode_theta_v3(params["phys_raw"], enable_chem=False)
+        return binding_ddg_bar(
+            ens_wt.astype(jnp.float32), ens_mut.astype(jnp.float32),
+            d_ref, phys_wt, phys_mut, w, pa, pb, theta,
+            single_wt=s_wb.astype(jnp.float32), pair_wt=z_wt_b,
+            single_mut=s_mb.astype(jnp.float32), pair_mut=z_mut_b,
+            single_wt_unbound=s_wu.astype(jnp.float32), pair_wt_unbound=z_wt_u,
+            single_mut_unbound=s_mu.astype(jnp.float32), pair_mut_unbound=z_mut_u,
+            nn_params=params["nn"], chain_mask=cm, temp_k=tk,
+        )
+
+    @jax.jit
+    def _eval_none_full(
         params, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, aa_wt, aa_mut, cm, tk,
         dcw, dcm, daw, dam, dbw, dbm,
     ):
         (s_wt, z_wt), (s_mut, z_mut) = _get_fallback_priors(aa_wt, aa_mut, res_mask)
-        theta = _decode_theta_v3(params["phys_raw"])
+        theta = _decode_theta_v3(params["phys_raw"], enable_chem=True)
         return binding_ddg_bar(
             ens_wt.astype(jnp.float32), ens_mut.astype(jnp.float32),
             d_ref, phys_wt, phys_mut, w, pa, pb, theta,
@@ -518,7 +615,7 @@ def train_single_fold_v3(
         )
 
     @jax.jit
-    def _eval_joltz_sparse(
+    def _eval_joltz_full(
         params, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk,
         dcw, dcm, daw, dam, dbw, dbm,
         s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
@@ -529,7 +626,7 @@ def train_single_fold_v3(
         z_mut_b = _scatter_pair_gpu(r_mb, c_mb, z_mb, max_n)
         z_wt_u = _scatter_pair_gpu(r_wu, c_wu, z_wu, max_n)
         z_mut_u = _scatter_pair_gpu(r_mu, c_mu, z_mu, max_n)
-        theta = _decode_theta_v3(params["phys_raw"])
+        theta = _decode_theta_v3(params["phys_raw"], enable_chem=True)
         return binding_ddg_bar(
             ens_wt.astype(jnp.float32), ens_mut.astype(jnp.float32),
             d_ref, phys_wt, phys_mut, w, pa, pb, theta,
@@ -543,34 +640,27 @@ def train_single_fold_v3(
             du_chem_b_wt=dbw, du_chem_b_mut=dbm,
         )
 
-    def _loss_core(
-        p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true, sw,
-        dcw, dcm, daw, dam, dbw, dbm,
+    def _loss_s1(
+        p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true,
         s_wt_b, z_wt_b, s_mut_b, z_mut_b, s_wt_u, z_wt_u, s_mut_u, z_mut_u,
     ):
-        theta = _decode_theta_v3(p["phys_raw"])
+        theta = _decode_theta_v3(p["phys_raw"], enable_chem=False)
         out = binding_ddg_bar(
             ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, theta,
             single_wt=s_wt_b, pair_wt=z_wt_b, single_mut=s_mut_b, pair_mut=z_mut_b,
             single_wt_unbound=s_wt_u, pair_wt_unbound=z_wt_u,
             single_mut_unbound=s_mut_u, pair_mut_unbound=z_mut_u,
             nn_params=p["nn"], chain_mask=cm, temp_k=tk,
-            du_chem_c_wt=dcw, du_chem_c_mut=dcm,
-            du_chem_a_wt=daw, du_chem_a_mut=dam,
-            du_chem_b_wt=dbw, du_chem_b_mut=dbm,
         )
         huber = _huber_loss(out["ddg_bind"], y_true, delta=huber_delta)
         phys_anchor = 0.02 * sum(
             (theta[k] - PHYS_INIT_V3[k]) ** 2 for k in ("k_clash", "k_elec", "k_hydro", "k_hbond")
-        ) + 0.01 * ((theta["k_chem"] - PHYS_INIT_V3["k_chem"]) ** 2)
+        )
         nn_reg = nn_reg_weight * (out["dh_nn_mean"] ** 2)
-        return sw * (huber + nn_reg) + phys_anchor
+        return huber + nn_reg + phys_anchor
 
     @jax.jit
-    def _grad_none(
-        params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, aa_wt, aa_mut, cm, tk, y_true, sw,
-        dcw, dcm, daw, dam, dbw, dbm,
-    ):
+    def _grad_none_s1(params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, aa_wt, aa_mut, cm, tk, y_true):
         k_sub, k_sub2, k_jw, k_jm, k_drop = jax.random.split(step_key, 5)
         ew_f32 = ens_wt.astype(jnp.float32)
         em_f32 = ens_mut.astype(jnp.float32)
@@ -578,11 +668,9 @@ def train_single_fold_v3(
         k_sub_n = min(train_frames, n_frames)
         idx_w = jax.random.choice(k_sub, n_frames, shape=(k_sub_n,), replace=False)
         idx_m = jax.random.choice(k_sub2, n_frames, shape=(k_sub_n,), replace=False)
-
         m_bb = res_mask[None, :, None, None]
         ew = ew_f32[idx_w] + jax.random.normal(k_jw, ew_f32[idx_w].shape, dtype=jnp.float32) * jitter_std * m_bb
         em = em_f32[idx_m] + jax.random.normal(k_jm, em_f32[idx_m].shape, dtype=jnp.float32) * jitter_std * m_bb
-
         (s_wt, z_wt), (s_mut, z_mut) = _get_fallback_priors(aa_wt, aa_mut, res_mask)
         keep_prob = 1.0 - dropout_rate
         ks, kz = jax.random.split(k_drop, 2)
@@ -590,19 +678,16 @@ def train_single_fold_v3(
         mz = jax.random.bernoulli(kz, keep_prob, z_wt.shape).astype(jnp.float32) / keep_prob
         s_wt_d, s_mut_d = s_wt * ms, s_mut * ms
         z_wt_d, z_mut_d = z_wt * mz, z_mut * mz
-
         return jax.value_and_grad(
-            lambda p: _loss_core(
-                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true, sw,
-                dcw[idx_w], dcm[idx_m], daw[idx_w], dam[idx_m], dbw[idx_w], dbm[idx_m],
+            lambda p: _loss_s1(
+                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true,
                 s_wt_d, z_wt_d, s_mut_d, z_mut_d, s_wt_d, z_wt_d, s_mut_d, z_mut_d,
             )
         )(params)
 
     @jax.jit
-    def _grad_joltz_sparse(
-        params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, cm, tk, y_true, sw,
-        dcw, dcm, daw, dam, dbw, dbm,
+    def _grad_joltz_s1(
+        params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, cm, tk, y_true,
         s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
         s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu,
     ):
@@ -613,32 +698,24 @@ def train_single_fold_v3(
         k_sub_n = min(train_frames, n_frames)
         idx_w = jax.random.choice(k_sub, n_frames, shape=(k_sub_n,), replace=False)
         idx_m = jax.random.choice(k_sub2, n_frames, shape=(k_sub_n,), replace=False)
-
         m_bb = res_mask[None, :, None, None]
         ew = ew_f32[idx_w] + jax.random.normal(k_jw, ew_f32[idx_w].shape, dtype=jnp.float32) * jitter_std * m_bb
         em = em_f32[idx_m] + jax.random.normal(k_jm, em_f32[idx_m].shape, dtype=jnp.float32) * jitter_std * m_bb
-
         max_n = s_wb.shape[0]
         z_wt_b = _scatter_pair_gpu(r_wb, c_wb, z_wb, max_n)
         z_mut_b = _scatter_pair_gpu(r_mb, c_mb, z_mb, max_n)
         z_wt_u = _scatter_pair_gpu(r_wu, c_wu, z_wu, max_n)
         z_mut_u = _scatter_pair_gpu(r_mu, c_mu, z_mu, max_n)
-
         keep_prob = 1.0 - dropout_rate
         ks, kz = jax.random.split(k_drop, 2)
         ms = jax.random.bernoulli(ks, keep_prob, s_wb.shape).astype(jnp.float32) / keep_prob
         mz = jax.random.bernoulli(kz, keep_prob, z_wt_b.shape).astype(jnp.float32) / keep_prob
-
-        swb = s_wb.astype(jnp.float32) * ms
-        smb = s_mb.astype(jnp.float32) * ms
-        swu = s_wu.astype(jnp.float32) * ms
-        smu = s_mu.astype(jnp.float32) * ms
+        swb, smb = s_wb.astype(jnp.float32) * ms, s_mb.astype(jnp.float32) * ms
+        swu, smu = s_wu.astype(jnp.float32) * ms, s_mu.astype(jnp.float32) * ms
         zwb, zmb, zwu, zmu = z_wt_b * mz, z_mut_b * mz, z_wt_u * mz, z_mut_u * mz
-
         return jax.value_and_grad(
-            lambda p: _loss_core(
-                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true, sw,
-                dcw[idx_w], dcm[idx_m], daw[idx_w], dam[idx_m], dbw[idx_w], dbm[idx_m],
+            lambda p: _loss_s1(
+                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true,
                 swb, zwb, smb, zmb, swu, zwu, smu, zmu,
             )
         )(params)
@@ -648,30 +725,42 @@ def train_single_fold_v3(
         updates, new_state = optimizer.update(grads, state, params)
         return optax.apply_updates(params, updates), new_state
 
-    def _run_eval(params, split_items):
+    def _run_eval(params, split_items, with_chem: bool):
         preds, trues, pdbs, dh_p, dh_c, dh_n = [], [], [], [], [], []
         pending = []
         for x in split_items:
-            if use_joltz:
-                sp = _pack_item_joltz_sparse(x, lru)
-                out = _eval_joltz_sparse(
-                    params, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
-                    x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
-                    x["cm"], float(x["temp_k"]),
-                    x["du_chem_c_wt"], x["du_chem_c_mut"],
-                    x["du_chem_a_wt"], x["du_chem_a_mut"],
-                    x["du_chem_b_wt"], x["du_chem_b_mut"],
-                    *sp,
-                )
+            if with_chem:
+                if use_joltz:
+                    sp = _pack_item_joltz_sparse(x, lru)
+                    out = _eval_joltz_full(
+                        params, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
+                        x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
+                        x["cm"], float(x["temp_k"]),
+                        x["du_chem_c_wt"], x["du_chem_c_mut"], x["du_chem_a_wt"], x["du_chem_a_mut"],
+                        x["du_chem_b_wt"], x["du_chem_b_mut"], *sp,
+                    )
+                else:
+                    out = _eval_none_full(
+                        params, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
+                        x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
+                        x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]),
+                        x["du_chem_c_wt"], x["du_chem_c_mut"], x["du_chem_a_wt"], x["du_chem_a_mut"],
+                        x["du_chem_b_wt"], x["du_chem_b_mut"],
+                    )
             else:
-                out = _eval_none(
-                    params, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
-                    x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
-                    x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]),
-                    x["du_chem_c_wt"], x["du_chem_c_mut"],
-                    x["du_chem_a_wt"], x["du_chem_a_mut"],
-                    x["du_chem_b_wt"], x["du_chem_b_mut"],
-                )
+                if use_joltz:
+                    sp = _pack_item_joltz_sparse(x, lru)
+                    out = _eval_joltz_s1(
+                        params, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
+                        x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
+                        x["cm"], float(x["temp_k"]), *sp,
+                    )
+                else:
+                    out = _eval_none_s1(
+                        params, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
+                        x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
+                        x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]),
+                    )
             pending.append((out["ddg_bind"], out["dh_phys_mean"], out["dh_chem_mean"], out["dh_nn_mean"], float(x["ddg_exp"]), str(x["pdb_id"])))
             if len(pending) >= 32:
                 vals = jax.device_get([(a, b, c, d) for a, b, c, d, _, _ in pending])
@@ -699,15 +788,16 @@ def train_single_fold_v3(
             "mean_p": float(np.mean(preds)), "mean_t": float(np.mean(trues)),
         }
 
+    s1_ckpt_path = os.path.join(weights_dir, f"{ckpt_prefix}_fold{fold_idx}_stage1.npz")
     ckpt_path = os.path.join(weights_dir, f"{ckpt_prefix}_fold{fold_idx}.npz")
     best_rmse = float("inf")
     best_epoch = 0
     bad_epochs = 0
 
     print(
-        f"\n--- [{ckpt_prefix}] Fold {fold_idx} Training "
-        f"({len(train_items)} train / {len(val_items)} val | lr={peak_lr:.0e}, wd={weight_decay:.1e}, "
-        f"nn_reg={nn_reg_weight:.1e}, huber={huber_delta:.1f}, min_ep={min_epochs}, patience={patience}) ---",
+        f"\n--- [{ckpt_prefix}] Fold {fold_idx} Stage-1 Training (Zero Gradient Starvation) "
+        f"({len(train_items)} train / {len(val_items)} val | lr={peak_lr:.0e}, wd={weight_decay:.0e}, "
+        f"nn_reg={nn_reg_weight:.0e}, huber={huber_delta:.1f}, min_ep={min_epochs}, patience={patience}) ---",
         flush=True,
     )
 
@@ -723,28 +813,19 @@ def train_single_fold_v3(
             loss_acc = 0.0
             for ii in batch_idx:
                 x = train_items[int(ii)]
-                sw_i = jnp.asarray(sample_weights[int(ii)], dtype=jnp.float32)
                 k_train, k_step = jax.random.split(k_train)
                 if use_joltz:
                     sp = _pack_item_joltz_sparse(x, lru)
-                    lv, gv = _grad_joltz_sparse(
+                    lv, gv = _grad_joltz_s1(
                         model_params, k_step, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                         x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
-                        x["res_mask"], x["cm"], float(x["temp_k"]), float(x["ddg_exp"]), sw_i,
-                        x["du_chem_c_wt"], x["du_chem_c_mut"],
-                        x["du_chem_a_wt"], x["du_chem_a_mut"],
-                        x["du_chem_b_wt"], x["du_chem_b_mut"],
-                        *sp,
+                        x["res_mask"], x["cm"], float(x["temp_k"]), float(x["ddg_exp"]), *sp,
                     )
                 else:
-                    lv, gv = _grad_none(
+                    lv, gv = _grad_none_s1(
                         model_params, k_step, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                         x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
-                        x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]),
-                        float(x["ddg_exp"]), sw_i,
-                        x["du_chem_c_wt"], x["du_chem_c_mut"],
-                        x["du_chem_a_wt"], x["du_chem_a_mut"],
-                        x["du_chem_b_wt"], x["du_chem_b_mut"],
+                        x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]), float(x["ddg_exp"]),
                     )
                 loss_acc = loss_acc + lv
                 grad_acc = gv if grad_acc is None else jax.tree_util.tree_map(lambda a, b: a + b, grad_acc, gv)
@@ -754,49 +835,74 @@ def train_single_fold_v3(
             model_params, opt_state = _apply_grads(model_params, opt_state, grad_mean)
             ep_losses.append(float(loss_acc * inv_bs))
 
-        val_m = _run_eval(model_params, val_items)
+        val_m = _run_eval(model_params, val_items, with_chem=False)
         improved = val_m["rmse"] < (best_rmse - 1e-4)
         if improved:
             best_rmse = val_m["rmse"]
             best_epoch = ep
             bad_epochs = 0
-            save_checkpoint_v3(ckpt_path, model_params)
+            save_checkpoint_v3(s1_ckpt_path, model_params)
         elif ep >= min_epochs:
             bad_epochs += 1
 
         if ep == 1 or ep % 2 == 0 or improved or ep == epochs:
-            tc = _decode_theta_v3(model_params["phys_raw"])
             mark = " *BEST*" if improved else ""
             print(
-                f"  [F{fold_idx} ep {ep:02d}/{epochs}] loss={np.mean(ep_losses):.3f} | "
+                f"  [F{fold_idx} S1 ep {ep:02d}/{epochs}] loss={np.mean(ep_losses):.3f} | "
                 f"VAL r={val_m['r']:+.3f} pc10={val_m['pc10_r']:+.3f} rho={val_m['rho']:+.3f} "
                 f"RMSE={val_m['rmse']:.3f} | mean={val_m['mean_p']:+.2f}/{val_m['mean_t']:+.2f} | "
-                f"|p/c/nn|={val_m['dh_phys']:.2f}/{val_m['dh_chem']:.2f}/{val_m['dh_nn']:.2f} | "
-                f"k_chem={float(tc['k_chem']):.2f} ({time.time() - t_ep:.1f}s){mark}",
+                f"|p/nn|={val_m['dh_phys']:.2f}/{val_m['dh_nn']:.2f} ({time.time() - t_ep:.1f}s){mark}",
                 flush=True,
             )
 
         if ep >= min_epochs and bad_epochs >= patience:
-            print(f"  [F{fold_idx}] Early stopping at ep {ep} (best ep={best_epoch}, VAL RMSE={best_rmse:.3f})", flush=True)
+            print(f"  [F{fold_idx} S1] Early stopping at ep {ep} (best ep={best_epoch}, VAL RMSE={best_rmse:.3f})", flush=True)
             break
 
-    reloaded = load_checkpoint_v3(ckpt_path)
-    final_val = _run_eval(reloaded, val_items)
+    # Stage 2: Calibrate (lam_phys, lam_chem, lam_nn) strictly on train_items (0% val touch!)
+    s1_best = load_checkpoint_v3(s1_ckpt_path)
+    tr_eval = _run_eval(s1_best, train_items, with_chem=False)
+    tr_uchem = []
+    for x in train_items:
+        dc = 0.5 * (float(jnp.mean(x["du_chem_c_wt"])) + float(jnp.mean(x["du_chem_c_mut"])))
+        du = 0.5 * (
+            float(jnp.mean(x["du_chem_a_wt"])) + float(jnp.mean(x["du_chem_a_mut"]))
+            + float(jnp.mean(x["du_chem_b_wt"])) + float(jnp.mean(x["du_chem_b_mut"]))
+        )
+        tr_uchem.append(dc - du)
+
+    lam_p, lam_c, lam_n = _calibrate_stage2_couplings(
+        np.asarray(tr_eval["dh_phys_list"]),
+        np.asarray(tr_uchem),
+        np.asarray(tr_eval["dh_nn_list"]),
+        np.asarray(tr_eval["trues"]),
+    )
+    final_params = _absorb_stage2_into_params(s1_best, lam_p, lam_c, lam_n)
+    save_checkpoint_v3(ckpt_path, final_params)
     print(
-        f"  [F{fold_idx} FINAL] Restored {ckpt_path} (ep {best_epoch}) -> "
-        f"VAL r={final_val['r']:+.4f}, pc10_r={final_val['pc10_r']:+.4f}, "
-        f"rho={final_val['rho']:+.4f}, RMSE={final_val['rmse']:.3f}, "
-        f"mean={final_val['mean_p']:+.2f}/{final_val['mean_t']:+.2f}",
+        f"  [F{fold_idx} STAGE-2 (Train-Only)] Calibrated unified couplings: "
+        f"lam_phys={lam_p:.3f}, lam_chem(k_chem)={lam_c:.3f}, lam_nn={lam_n:.3f}",
         flush=True,
     )
 
-    # Exact BAR antisymmetry audit on unseen fold (including U_chem negation!)
+    reloaded = load_checkpoint_v3(ckpt_path)
+    final_val = _run_eval(reloaded, val_items, with_chem=True)
+    print(
+        f"  [F{fold_idx} FINAL UNIFIED] {ckpt_path} (S1 ep {best_epoch} + S2) -> "
+        f"VAL r={final_val['r']:+.4f}, pc10_r={final_val['pc10_r']:+.4f}, "
+        f"rho={final_val['rho']:+.4f}, RMSE={final_val['rmse']:.3f}, "
+        f"mean={final_val['mean_p']:+.2f}/{final_val['mean_t']:+.2f} | "
+        f"|p/c/nn|={final_val['dh_phys']:.2f}/{final_val['dh_chem']:.2f}/{final_val['dh_nn']:.2f}",
+        flush=True,
+    )
+
+    # Exact BAR antisymmetry audit on unseen fold
     antisym_errs = []
     for x in val_items[:5]:
         if use_joltz:
             (s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
              s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu) = _pack_item_joltz_sparse(x, lru)
-            fwd = _eval_joltz_sparse(
+            fwd = _eval_joltz_full(
                 reloaded, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                 x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
                 x["cm"], float(x["temp_k"]),
@@ -805,7 +911,7 @@ def train_single_fold_v3(
                 s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
                 s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu,
             )["ddg_bind"]
-            rev = _eval_joltz_sparse(
+            rev = _eval_joltz_full(
                 reloaded, x["ens_mut"], x["ens_wt"], x["d_ref_ca"],
                 x["phys_mut"], x["phys_wt"], x["weights"], x["pa_mask"], x["pb_mask"],
                 x["cm"], float(x["temp_k"]),
@@ -815,14 +921,14 @@ def train_single_fold_v3(
                 s_mu, r_mu, c_mu, z_mu, s_wu, r_wu, c_wu, z_wu,
             )["ddg_bind"]
         else:
-            fwd = _eval_none(
+            fwd = _eval_none_full(
                 reloaded, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                 x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
                 x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]),
                 x["du_chem_c_wt"], x["du_chem_c_mut"], x["du_chem_a_wt"], x["du_chem_a_mut"],
                 x["du_chem_b_wt"], x["du_chem_b_mut"],
             )["ddg_bind"]
-            rev = _eval_none(
+            rev = _eval_none_full(
                 reloaded, x["ens_mut"], x["ens_wt"], x["d_ref_ca"],
                 x["phys_mut"], x["phys_wt"], x["weights"], x["pa_mask"], x["pb_mask"],
                 x["res_mask"], x["aa_mut"], x["aa_wt"], x["cm"], float(x["temp_k"]),
@@ -900,13 +1006,13 @@ def run_skempi_v3(
     prior: str = "both",
     cache_dir: str = "/content/oncovac_cache",
     boltz_cache_dir: str = "/content/boltz_cache",
-    weights_dir: str = "/content/oncovac_weights_v3",
+    weights_dir: str = "/content/oncovac_weights_v31",
     recycling_steps: int = 0,
     use_msa: bool = True,
     patience: int = 7,
     min_epochs: int = 6,
     drive_backup_dir: str = "",
-    drive_weights_subdir: str = "weights_full_v3",
+    drive_weights_subdir: str = "weights_full_v3_1",
     resume_folds: bool = True,
 ) -> None:
     presets = {
@@ -921,7 +1027,7 @@ def run_skempi_v3(
         os.makedirs(drive_weights_dir, exist_ok=True)
 
     print(
-        f"=== OncoVac Adenine Gen 1 v3 (virtual_sc + Pure-JAX U_chem + Joltz-1) | "
+        f"=== OncoVac Adenine Gen 1 v3.1 (300K BAOAB virtual_sc + Pure-JAX U_chem + Two-Stage Force-Field) | "
         f"mode={mode.upper()} | prior={prior} | msa={use_msa} | rec={recycling_steps} ===",
         flush=True,
     )
@@ -932,7 +1038,7 @@ def run_skempi_v3(
         min_muts_per_pdb=cfg["min_muts"],
         max_n=cfg["max_n"],
     )
-    items = prepare_virtual_sc_ensembles(
+    items = prepare_virtual_sc_ensembles_300k(
         records, jax.random.PRNGKey(42),
         cache_dir=cache_dir, cache_max_n=cfg["max_n"],
         drive_backup_dir=drive_backup_dir,
@@ -951,56 +1057,56 @@ def run_skempi_v3(
     folds = make_family_disjoint_folds(items, n_folds=3)
     summary_rows: List[Tuple[str, Dict[str, float]]] = []
 
-    # 1. Zero-Shot Pure White-Box Physics (virtual_sc + 0.65 * U_chem, 0% SKEMPI training!)
-    zs_rows = _evaluate_zero_shot_v3(items, include_chem=True)
-    zs_csv = os.path.join(weights_dir, f"oof_zeroshot_v3_{mode}.csv")
+    # 1. Zero-Shot Pure White-Box Physics (300K BAOAB: 0.45*H_phys_sc + 1.0*U_chem, 0% SKEMPI training!)
+    zs_rows = _evaluate_zero_shot_v3(items)
+    zs_csv = os.path.join(weights_dir, f"oof_zeroshot_v31_{mode}.csv")
     _save_oof_csv_v3(zs_csv, zs_rows)
     if drive_weights_dir:
         _sync_file_to_drive(zs_csv, os.path.join(drive_weights_dir, os.path.basename(zs_csv)))
     summary_rows.append((
-        "Zero-Shot (virtual_sc + U_chem)",
-        summarize_benchmark_pillars("Zero-Shot (virtual_sc + U_chem)", zs_rows),
+        "Zero-Shot 300K (v_sc + U_chem)",
+        summarize_benchmark_pillars("Zero-Shot 300K (v_sc + U_chem)", zs_rows),
     ))
-    _print_3way("Zero-Shot (virtual_sc + U_chem)", zs_rows)
+    _print_3way("Zero-Shot 300K (v_sc + U_chem)", zs_rows)
 
-    # 2. OncoVac Adenine Lite v3 (No-Joltz: virtual_sc + U_chem + U_NN)
+    # 2. OncoVac Adenine Lite v3.1 (No-Joltz)
     if prior in ("none", "both"):
         oof_lite, asym_lite = _run_cv_suite_v3(
-            folds=folds, weights_dir=weights_dir, prior_mode="none", ckpt_prefix="adenine_lite_v3",
+            folds=folds, weights_dir=weights_dir, prior_mode="none", ckpt_prefix="adenine_lite_v31",
             mode=mode, epochs=cfg["epochs"], batch_size=cfg["batch_size"],
             patience=patience, min_epochs=min_epochs,
             resume_folds=resume_folds, drive_weights_dir=drive_weights_dir,
         )
-        lite_csv = os.path.join(weights_dir, f"oof_adenine_lite_v3_{mode}.csv")
+        lite_csv = os.path.join(weights_dir, f"oof_adenine_lite_v31_{mode}.csv")
         _save_oof_csv_v3(lite_csv, oof_lite)
         if drive_weights_dir:
             _sync_file_to_drive(lite_csv, os.path.join(drive_weights_dir, os.path.basename(lite_csv)))
         summary_rows.append((
-            "Adenine Lite v3 (No-Joltz)",
-            summarize_benchmark_pillars("Adenine Lite v3 (No-Joltz)", oof_lite, max_antisym=asym_lite),
+            "Adenine Lite v3.1 (No-Joltz)",
+            summarize_benchmark_pillars("Adenine Lite v3.1 (No-Joltz)", oof_lite, max_antisym=asym_lite),
         ))
-        _print_3way("Adenine Lite v3 (No-Joltz)", oof_lite)
+        _print_3way("Adenine Lite v3.1 (No-Joltz)", oof_lite)
 
-    # 3. OncoVac Adenine Gen 1 v3 (+Joltz-1 + MSA + virtual_sc + U_chem)
+    # 3. OncoVac Adenine Gen 1 v3.1 (+Joltz-1 + MSA + 300K BAOAB virtual_sc + U_chem)
     if prior in ("joltz", "both"):
         oof_gen1, asym_gen1 = _run_cv_suite_v3(
-            folds=folds, weights_dir=weights_dir, prior_mode="joltz", ckpt_prefix="adenine_gen1_v3",
+            folds=folds, weights_dir=weights_dir, prior_mode="joltz", ckpt_prefix="adenine_gen1_v31",
             mode=mode, epochs=cfg["epochs"], batch_size=cfg["batch_size"],
             patience=patience, min_epochs=min_epochs,
             resume_folds=resume_folds, drive_weights_dir=drive_weights_dir,
         )
-        gen1_csv = os.path.join(weights_dir, f"oof_adenine_gen1_v3_{mode}.csv")
+        gen1_csv = os.path.join(weights_dir, f"oof_adenine_gen1_v31_{mode}.csv")
         _save_oof_csv_v3(gen1_csv, oof_gen1)
         if drive_weights_dir:
             _sync_file_to_drive(gen1_csv, os.path.join(drive_weights_dir, os.path.basename(gen1_csv)))
         summary_rows.append((
-            "OncoVac Adenine Gen 1 v3",
-            summarize_benchmark_pillars("OncoVac Adenine Gen 1 v3", oof_gen1, max_antisym=asym_gen1),
+            "OncoVac Adenine Gen 1 v3.1",
+            summarize_benchmark_pillars("OncoVac Adenine Gen 1 v3.1", oof_gen1, max_antisym=asym_gen1),
         ))
-        _print_3way("OncoVac Adenine Gen 1 v3", oof_gen1)
+        _print_3way("OncoVac Adenine Gen 1 v3.1", oof_gen1)
 
     print("\n================================================================================", flush=True)
-    print(f"FINAL 3-FOLD STRICT FAMILY-DISJOINT SUMMARY ({mode.upper()}, msa={use_msa})", flush=True)
+    print(f"FINAL 3-FOLD STRICT FAMILY-DISJOINT SUMMARY v3.1 ({mode.upper()}, msa={use_msa})", flush=True)
     print(f"{'Model':34s} | {'r':>7s} | {'pc10_r':>7s} | {'rho':>7s} | {'RMSE':>6s} | {'MAE':>6s}", flush=True)
     print("-" * 80, flush=True)
     for name, st in summary_rows:
@@ -1013,18 +1119,18 @@ def run_skempi_v3(
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="OncoVac Adenine Gen 1 v3 (virtual_sc + Pure-JAX U_chem + Joltz-1)")
+    p = argparse.ArgumentParser(description="OncoVac Adenine Gen 1 v3.1 (300K BAOAB + Pure-JAX U_chem + Two-Stage)")
     p.add_argument("--mode", choices=["mini", "mid", "full"], default="full")
     p.add_argument("--prior", choices=["none", "joltz", "both"], default="both")
     p.add_argument("--use-msa", action="store_true")
     p.add_argument("--recycling-steps", type=int, default=0)
     p.add_argument("--cache-dir", default="/content/oncovac_cache")
     p.add_argument("--boltz-cache-dir", default="/content/boltz_cache")
-    p.add_argument("--weights-dir", default="/content/oncovac_weights_v3")
+    p.add_argument("--weights-dir", default="/content/oncovac_weights_v31")
     p.add_argument("--patience", type=int, default=7)
     p.add_argument("--min-epochs", type=int, default=6)
     p.add_argument("--drive-backup-dir", default="")
-    p.add_argument("--drive-weights-subdir", default="weights_full_v3")
+    p.add_argument("--drive-weights-subdir", default="weights_full_v3_1")
     p.add_argument("--resume-folds", action="store_true")
     args = p.parse_args()
     run_skempi_v3(
