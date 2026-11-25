@@ -6,8 +6,8 @@ import jax.numpy as jnp
 AA_ORDER = "ARNDCQEGHILKMFPSTWYV"
 AA_TO_IDX = {aa: idx for idx, aa in enumerate(AA_ORDER)}
 
-# Matches single-chain ("Y220C") and SKEMPI 2.0 chain/icode ("YA220C", "YA220BC", "Y-5C")
-_MUT_PATTERN = re.compile(r"^([A-Z])([A-Z])?(-?\d+)([A-Z])?([A-Z])$")
+# Matches single-chain ("Y220C") and SKEMPI 2.0 chain/icode ("YA220C", "YA220BC", "Y1220C", "Y-5C")
+_MUT_PATTERN = re.compile(r"^([A-Z])([A-Za-z0-9])?(-?\d+)([A-Z])?([A-Z])$")
 
 
 def parse(
@@ -15,23 +15,30 @@ def parse(
     start_resnum: int = 1,
     res_map: Optional[Dict[Union[int, str, Tuple[Optional[str], Union[int, str]]], int]] = None,
 ) -> dict:
-    clean = code.strip().upper()
+    clean = code.strip()
     match = _MUT_PATTERN.match(clean)
+    if not match:
+        clean_up = clean.upper()
+        match = _MUT_PATTERN.match(clean_up)
     if not match:
         raise ValueError(f"Invalid mutation code format: '{code}'")
 
     wt_aa, chain, pos_str, icode, mut_aa = match.groups()
+    wt_aa = wt_aa.upper()
+    mut_aa = mut_aa.upper()
     if wt_aa not in AA_TO_IDX or mut_aa not in AA_TO_IDX:
         raise ValueError(f"Non-canonical amino acid in mutation '{code}': wt='{wt_aa}', mut='{mut_aa}'")
 
     pos_1based = int(pos_str)
-    icode = icode or ""
+    icode = (icode or "").upper()
     res_label = f"{pos_1based}{icode}"
 
     if res_map is not None:
         lookup_keys = [
             (chain, res_label),
             (chain, pos_1based),
+            (chain.upper() if chain else None, res_label),
+            (chain.upper() if chain else None, pos_1based),
             res_label,
             pos_1based,
         ]
@@ -113,29 +120,29 @@ AA_PHYSICS = jnp.array([
 ], dtype=jnp.float32)
 
 
-# 5-column full-state table for potentials.py:
-# [volume_norm, charge_pH7.4, hydrophobicity_norm, hbond_donor, hbond_acc]
+# 6-column full-state table for potentials.py (OncoVac Adenine Gen 1 virtual_sc):
+# [volume_norm, charge_pH7.4, hydrophobicity_norm, hbond_donor, hbond_acc, l_sc_angstrom]
 AA_PHYS_STATE = jnp.array([
-    [0.31,  0.0,  1.8 / 4.5, 0.0, 0.0],  # A
-    [0.85,  1.0, -4.5 / 4.5, 1.0, 0.0],  # R
-    [0.51,  0.0, -3.5 / 4.5, 1.0, 1.0],  # N
-    [0.49, -1.0, -3.5 / 4.5, 0.0, 1.0],  # D
-    [0.44,  0.0,  2.5 / 4.5, 0.5, 0.5],  # C
-    [0.63,  0.0, -3.5 / 4.5, 1.0, 1.0],  # Q
-    [0.61, -1.0, -3.5 / 4.5, 0.0, 1.0],  # E
-    [0.00,  0.0, -0.4 / 4.5, 0.0, 0.0],  # G
-    [0.68,  0.5, -3.2 / 4.5, 1.0, 1.0],  # H
-    [0.73,  0.0,  4.5 / 4.5, 0.0, 0.0],  # I
-    [0.73,  0.0,  3.8 / 4.5, 0.0, 0.0],  # L
-    [0.74,  1.0, -3.9 / 4.5, 1.0, 0.0],  # K
-    [0.71,  0.0,  1.9 / 4.5, 0.0, 0.0],  # M
-    [0.83,  0.0,  2.8 / 4.5, 0.0, 0.0],  # F
-    [0.49,  0.0, -1.6 / 4.5, 0.0, 0.0],  # P
-    [0.33,  0.0, -0.8 / 4.5, 1.0, 1.0],  # S
-    [0.48,  0.0, -0.7 / 4.5, 1.0, 1.0],  # T
-    [1.00,  0.0, -0.9 / 4.5, 1.0, 0.0],  # W
-    [0.86,  0.0, -1.3 / 4.5, 1.0, 1.0],  # Y
-    [0.59,  0.0,  4.2 / 4.5, 0.0, 0.0],  # V
+    [0.31,  0.0,  1.8 / 4.5, 0.0, 0.0, 1.53],  # A
+    [0.85,  1.0, -4.5 / 4.5, 1.0, 0.0, 4.65],  # R
+    [0.51,  0.0, -3.5 / 4.5, 1.0, 1.0, 2.55],  # N
+    [0.49, -1.0, -3.5 / 4.5, 0.0, 1.0, 2.55],  # D
+    [0.44,  0.0,  2.5 / 4.5, 0.5, 0.5, 2.10],  # C
+    [0.63,  0.0, -3.5 / 4.5, 1.0, 1.0, 3.27],  # Q
+    [0.61, -1.0, -3.5 / 4.5, 0.0, 1.0, 3.25],  # E
+    [0.00,  0.0, -0.4 / 4.5, 0.0, 0.0, 0.00],  # G
+    [0.68,  0.5, -3.2 / 4.5, 1.0, 1.0, 3.18],  # H
+    [0.73,  0.0,  4.5 / 4.5, 0.0, 0.0, 2.49],  # I
+    [0.73,  0.0,  3.8 / 4.5, 0.0, 0.0, 2.62],  # L
+    [0.74,  1.0, -3.9 / 4.5, 1.0, 0.0, 4.10],  # K
+    [0.71,  0.0,  1.9 / 4.5, 0.0, 0.0, 3.18],  # M
+    [0.83,  0.0,  2.8 / 4.5, 0.0, 0.0, 3.41],  # F
+    [0.49,  0.0, -1.6 / 4.5, 0.0, 0.0, 1.88],  # P
+    [0.33,  0.0, -0.8 / 4.5, 1.0, 1.0, 1.95],  # S
+    [0.48,  0.0, -0.7 / 4.5, 1.0, 1.0, 1.98],  # T
+    [1.00,  0.0, -0.9 / 4.5, 1.0, 0.0, 3.90],  # W
+    [0.86,  0.0, -1.3 / 4.5, 1.0, 1.0, 3.85],  # Y
+    [0.59,  0.0,  4.2 / 4.5, 0.0, 0.0, 1.99],  # V
 ], dtype=jnp.float32)
 
 
@@ -157,3 +164,4 @@ def encode(seq: str) -> dict:
 #   - Hydropathy (exact): Kyte & Doolittle (1982), J. Mol. Biol. 157(1):105-132
 #   - Normalized steric volume [0..1]: Zamyatnin (1972), Prog. Biophys. Mol. Biol. 24:107-123; Richards (1974)
 #   - Side-chain H-bond donor/acceptor capacity: McDonald & Thornton (1994), J. Mol. Biol. 238(5):777-793
+#   - Amino-acid CA -> side-chain centroid reach L_sc [A]: Liwo et al. (1997) UNRES; Engh & Huber (1991)
