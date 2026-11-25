@@ -35,8 +35,16 @@ PHYS_INIT = {
     "k_hbond": 1.5,
 }
 
-# Static sparse edge buckets for bit-exact GPU scatter (limits XLA compilation to 3-4 shapes)
+# Static length & sparse-edge buckets (limits XLA compilation while avoiding wasted O(N^2) padding)
+LEN_BUCKETS = (256, 384, 512)
 EDGE_BUCKETS = (4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 262144)
+
+
+def _pick_len_bucket(n_res: int, max_n: int) -> int:
+    for b in LEN_BUCKETS:
+        if b <= max_n and n_res <= b:
+            return b
+    return int(max_n)
 
 
 def _inv_softplus(y: float) -> float:
@@ -66,7 +74,7 @@ def save_checkpoint(path: str, model_params: Dict[str, Dict[str, jnp.ndarray]]) 
     flat = {}
     for group, sub in model_params.items():
         for k, v in sub.items():
-            flat[f"{group}__{k}"] = np.asarray(v, dtype=np.float32)
+            flat[f"{group}__{k}"] = np.asarray(v, dtype=jnp.float32)
     tmp_path = path + ".tmp.npz"
     np.savez_compressed(tmp_path, **flat)
     os.replace(tmp_path, path)
@@ -149,7 +157,7 @@ class _SparsePriorLRU:
     """
     Bounded in-RAM LRU cache for sparse Joltz-1 .npz files (~1.5-3.5 MB each).
     Eliminates repeated disk I/O across epochs while automatically capping memory
-    to <= min(24 GB, 35% of total RAM) so both A100 (83 GB) and T4 (12.7 GB) stay safe.
+    to <= min(24 GB, 35% of total RAM) so TPU (170 GB), A100 (83 GB), and T4 (12.7 GB) stay safe.
     """
 
     def __init__(self, max_bytes: Optional[int] = None) -> None:
@@ -236,8 +244,8 @@ def _pack_item_joltz_sparse(
     c_z: int = 128,
 ) -> Tuple[np.ndarray, ...]:
     """
-    Loads sparse Joltz-1 arrays from RAM LRU cache and packs them into static edge buckets
-    (~6-16 MB vs ~268 MB dense CPU arrays) for bit-exact GPU scatter inside @jax.jit.
+    Loads sparse Joltz-1 arrays from RAM LRU cache and packs them into tight length & edge buckets
+    for bit-exact GPU/TPU scatter inside @jax.jit.
     """
     jp = x["joltz_paths"]
     idx_a: np.ndarray = x["idx_a"]
@@ -292,7 +300,7 @@ def _pack_item_joltz_sparse(
 def _scatter_pair_gpu(
     r: jnp.ndarray, c: jnp.ndarray, zv: jnp.ndarray, max_n: int, c_z: int = 128
 ) -> jnp.ndarray:
-    """Bit-exact GPU scatter of sparse contact pair features into dense [max_n, max_n, c_z]."""
+    """Bit-exact GPU/TPU scatter of sparse contact pair features into dense [max_n, max_n, c_z]."""
     return (
         jnp.zeros((max_n, max_n, c_z), dtype=jnp.float32)
         .at[r.astype(jnp.int32), c.astype(jnp.int32)]
@@ -340,7 +348,7 @@ def load_skempi_records(
     """
     Downloads official skempi_v2.csv + RCSB PDBs, balances across distinct Hold_out_type protein
     families (Pr/PI, AB/AG, TCR/pMHC, Other), deduplicates identical mutations by mean ddG,
-    and returns validated records with lightweight arrays.
+    and pads each complex to its tightest length bucket (256, 384, 512) for ~2x faster O(N^2) training.
     """
     csv_path = os.path.join(cache_dir, "skempi_v2.csv")
     if not _download_if_missing(SKEMPI_CSV_URL, csv_path):
@@ -400,6 +408,7 @@ def load_skempi_records(
 
     records: List[Dict[str, object]] = []
     loaded_pdbs: set = set()
+    bucket_hist: Dict[int, int] = defaultdict(int)
 
     for ckey in ordered_complexes:
         if len(loaded_pdbs) >= max_complexes:
@@ -423,9 +432,10 @@ def load_skempi_records(
         if n_res > max_n:
             continue
 
-        bb, cm, res_mask = pad_structure(pdb_data["backbone"], pdb_data["chain_mask"], max_n=max_n)
+        item_n = _pick_len_bucket(n_res, max_n)
+        bb, cm, res_mask = pad_structure(pdb_data["backbone"], pdb_data["chain_mask"], max_n=item_n)
         chain_ids: List[str] = list(pdb_data["chain_ids"])
-        pad_len = max_n - n_res
+        pad_len = item_n - n_res
 
         idx_a = np.asarray([i for i, c in enumerate(chain_ids) if c in chains_a], dtype=np.int32)
         idx_b = np.asarray([i for i, c in enumerate(chain_ids) if c in chains_b], dtype=np.int32)
@@ -454,7 +464,7 @@ def load_skempi_records(
                 break
             try:
                 mut_seq = apply_mutations(wt_seq, mut_code, res_map=pdb_data["res_map"])
-                mut_mask = jnp.zeros((max_n,), dtype=jnp.float32)
+                mut_mask = jnp.zeros((item_n,), dtype=jnp.float32)
                 toks = [tok.strip() for tok in mut_code.split(",") if tok.strip()]
                 for tok in toks:
                     info = parse(tok, res_map=pdb_data["res_map"])
@@ -480,7 +490,7 @@ def load_skempi_records(
                 "mut_code": mut_code,
                 "n_muts": len(toks),
                 "n_res": n_res,
-                "max_n": max_n,
+                "max_n": item_n,
                 "ddg_exp": ddg_exp,
                 "temp_k": temp_k,
                 "bb": bb,
@@ -499,12 +509,14 @@ def load_skempi_records(
         if len(complex_recs) >= min_muts_per_pdb:
             records.extend(complex_recs)
             loaded_pdbs.add(pdb_id)
+            bucket_hist[item_n] += len(complex_recs)
             print(
-                f"[LOAD] {pdb_id} ({ch_a_str}_{ch_b_str} | fam={complex_family[ckey]:10s} | N={n_res:3d}): "
-                f"{len(complex_recs)} muts",
+                f"[LOAD] {pdb_id} ({ch_a_str}_{ch_b_str} | fam={complex_family[ckey]:10s} | "
+                f"N={n_res:3d}->B={item_n}): {len(complex_recs)} muts",
                 flush=True,
             )
 
+    print(f"[LOAD] Total {len(loaded_pdbs)} PDBs / {len(records)} muts | length buckets: {dict(sorted(bucket_hist.items()))}", flush=True)
     return records
 
 
@@ -552,7 +564,6 @@ def make_family_disjoint_folds(
     for p in pdbs:
         clusters[_find(p)].append(p)
 
-    # If named Hold_out_type merged nearly everything into < n_folds, fall back to sequence-homology clusters
     if len(clusters) < n_folds:
         parent_seq = {p: p for p in pdbs}
 
@@ -608,14 +619,18 @@ def prepare_cached_ensembles(
     records: List[Dict[str, object]],
     prng_key: jax.Array,
     cache_dir: str = "/content/oncovac_cache",
+    cache_max_n: int = 512,
     num_replicas: int = 2,
     num_steps: int = 40,
     burn_in: int = 16,
     stride: int = 8,
     drive_backup_dir: str = "",
 ) -> List[Dict[str, object]]:
-    """Generates and disk-caches equilibrium BAOAB ensembles in compact CPU float16 (~55 KB/state)."""
-    sde_subdir = f"baoab_n{records[0]['bb'].shape[0]}_r{num_replicas}_s{num_steps}"
+    """
+    Loads or generates equilibrium BAOAB ensembles in compact CPU float16.
+    Automatically reuses existing baoab_n{cache_max_n} caches on Drive by slicing to each item's tight bucket!
+    """
+    sde_subdir = f"baoab_n{cache_max_n}_r{num_replicas}_s{num_steps}"
     sde_dir = os.path.join(cache_dir, sde_subdir)
     os.makedirs(sde_dir, exist_ok=True)
     theta_sde = {**PHYS_INIT, "k_rep": 0.0, "enm_soften": 1.0}
@@ -637,16 +652,21 @@ def prepare_cached_ensembles(
     t_sde = time.time()
 
     for i, rec in enumerate(records):
+        item_n = int(rec["max_n"])
         safe_mut = re.sub(r"[^A-Za-z0-9_]+", "_", str(rec["mut_code"]))
         npz_path = os.path.join(sde_dir, f"{rec['pdb_id']}_{safe_mut}.npz")
+        loaded_ok = False
         if os.path.exists(npz_path):
             with np.load(npz_path, allow_pickle=False) as cached:
-                ens_wt = np.array(cached["ens_wt"], dtype=np.float16, copy=True)
-                ens_mut = np.array(cached["ens_mut"], dtype=np.float16, copy=True)
-                t_wt = float(cached["t_wt"])
-                t_mut = float(cached["t_mut"])
-            n_loaded += 1
-        else:
+                if cached["ens_wt"].shape[1] >= item_n:
+                    ens_wt = np.array(cached["ens_wt"][:, :item_n], dtype=np.float16, copy=True)
+                    ens_mut = np.array(cached["ens_mut"][:, :item_n], dtype=np.float16, copy=True)
+                    t_wt = float(cached["t_wt"])
+                    t_mut = float(cached["t_mut"])
+                    loaded_ok = True
+                    n_loaded += 1
+
+        if not loaded_ok:
             k_wt, k_mut = jax.random.split(jax.random.fold_in(prng_key, i))
             tk = float(rec["temp_k"])
             ens_wt_j, t_wt_a = _sample_state(
@@ -725,7 +745,6 @@ def prepare_joltz_priors_cache(
     synced_priors = _init_synced_index(drive_prior_dir) if drive_prior_dir else set()
     last_sync_trunk = 0
 
-    # Precompute symmetric contact pair indices (d_cb <= 16 A, generous 6 A margin over R_SHORT=10 A) per PDB
     pdb_contacts: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     pdb_wt_seen: set = set()
     for it in items:
@@ -781,7 +800,6 @@ def prepare_joltz_priors_cache(
             wt_ua_path = runner.extract_sparse_priors(wt_seq_a, cids_a, r_a, c_a, pid, "unbound_a", strip_pairing=True)
             wt_ub_path = runner.extract_sparse_priors(wt_seq_b, cids_b, r_bb, c_bb, pid, "unbound_b", strip_pairing=True)
 
-            # Unchanged unbound partner reuses WT prior bit-for-bit (exact zero telepathy)
             mut_ua_path = (
                 wt_ua_path
                 if mut_seq_a == wt_seq_a
@@ -808,7 +826,7 @@ def prepare_joltz_priors_cache(
                 "mut_ub": mut_ub_path,
             },
         })
-        if (idx + 1) % 25 == 0 or (idx + 1) == len(items):
+        if (idx + 1) % 250 == 0 or (idx + 1) == len(items):
             print(
                 f"[JOLTZ] Cached {idx + 1}/{len(items)} mutations "
                 f"(valid={len(enriched)}, skipped={skipped}, new trunk evals={runner.trunk_calls}, "
@@ -831,25 +849,27 @@ def prepare_joltz_priors_cache(
     return enriched
 
 
-def _huber_loss(pred: jnp.ndarray, target: jnp.ndarray, delta: float = 1.5) -> jnp.ndarray:
+def _huber_loss(pred: jnp.ndarray, target: jnp.ndarray, delta: float = 3.5) -> jnp.ndarray:
     diff = jnp.abs(pred - target)
     return jnp.where(diff <= delta, 0.5 * diff ** 2, delta * (diff - 0.5 * delta))
 
 
-def _per_complex_stats(preds: List[float], trues: List[float], pdbs: List[str]) -> Tuple[float, float]:
+def _per_complex_stats(
+    preds: List[float], trues: List[float], pdbs: List[str], min_muts: int = 3
+) -> Tuple[float, float, int]:
     by_pdb: Dict[str, Tuple[List[float], List[float]]] = defaultdict(lambda: ([], []))
     for p, t, pid in zip(preds, trues, pdbs):
         by_pdb[pid][0].append(p)
         by_pdb[pid][1].append(t)
     pearsons, spearmans = [], []
     for ps, ts in by_pdb.values():
-        if len(ps) >= 3 and np.std(ts) > 1e-6 and np.std(ps) > 1e-6:
+        if len(ps) >= min_muts and np.std(ts) > 1e-6 and np.std(ps) > 1e-6:
             m = skempi_metrics(jnp.asarray(ps), jnp.asarray(ts))
             pearsons.append(float(m["pearson_r"]))
             spearmans.append(float(m["spearman_rho"]))
     pc_r = float(np.mean(pearsons)) if pearsons else float("nan")
     pc_rho = float(np.mean(spearmans)) if spearmans else float("nan")
-    return pc_r, pc_rho
+    return pc_r, pc_rho, len(pearsons)
 
 
 def _evaluate_zero_shot_hphys(items: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -964,23 +984,38 @@ def train_single_fold(
     weights_dir: str,
     prior_mode: str = "none",
     ckpt_prefix: str = "adenine_nojoltz",
-    epochs: int = 25,
-    batch_size: int = 12,
-    peak_lr: float = 5e-4,
-    weight_decay: float = 3e-2,
+    epochs: int = 24,
+    batch_size: int = 16,
+    peak_lr: float = 3e-4,
+    weight_decay: float = 1e-2,
     dropout_rate: float = 0.15,
     jitter_std: float = 0.02,
-    nn_reg_weight: float = 3e-2,
-    patience: int = 8,
-    min_epochs: int = 6,
+    nn_reg_weight: float = 3e-3,
+    huber_delta: float = 3.5,
+    train_frames: int = 3,
+    patience: int = 7,
+    min_epochs: int = 5,
     sparse_lru: Optional[_SparsePriorLRU] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, Dict[str, jnp.ndarray]], float]:
     """
-    Trains one CV fold with all 5 anti-overfitting defenses & joint calibration of 4 physical constants + U_NN.
-    Uses bit-exact sparse-to-GPU scatter + RAM LRU caching for 8x-12x faster Joltz-1 training.
+    Trains one CV fold with:
+      - Complex-balanced inverse-sqrt sample weighting (1 / sqrt(n_muts_pdb)) on train only,
+      - Unchoked Huber(delta=3.5) + gentle nn_reg=3e-3 + calm lr=3e-4 + wd=1e-2,
+      - Tight length buckets (256, 384, 512) + 3-frame stochastic BAR subsampling (~3.3x faster!),
+      - Full 6-frame exact BAR evaluation & unseen-family antisymmetry audit.
     """
     use_joltz = (prior_mode == "joltz")
     lru = sparse_lru if (sparse_lru is not None) else (_SparsePriorLRU() if use_joltz else None)
+
+    # Complex-balanced inverse-sqrt weights strictly computed on train_items (zero val leakage)
+    tr_pdb_counts: Dict[str, int] = defaultdict(int)
+    for it in train_items:
+        tr_pdb_counts[str(it["pdb_id"])] += 1
+    raw_sw = np.asarray(
+        [1.0 / np.sqrt(float(tr_pdb_counts[str(it["pdb_id"])])) for it in train_items],
+        dtype=np.float32,
+    )
+    sample_weights = raw_sw / float(np.mean(raw_sw))
 
     key = jax.random.PRNGKey(100 + fold_idx)
     k_init, k_prior_base, k_train = jax.random.split(key, 3)
@@ -1049,7 +1084,7 @@ def train_single_fold(
             nn_params=params["nn"], chain_mask=cm, temp_k=tk,
         )
 
-    def _loss_core(p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true,
+    def _loss_core(p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true, sw,
                    s_wt_b, z_wt_b, s_mut_b, z_mut_b, s_wt_u, z_wt_u, s_mut_u, z_mut_u):
         theta = _decode_theta(p["phys_raw"])
         out = binding_ddg_bar(
@@ -1059,20 +1094,20 @@ def train_single_fold(
             single_mut_unbound=s_mut_u, pair_mut_unbound=z_mut_u,
             nn_params=p["nn"], chain_mask=cm, temp_k=tk,
         )
-        huber = _huber_loss(out["ddg_bind"], y_true, delta=1.5)
+        huber = _huber_loss(out["ddg_bind"], y_true, delta=huber_delta)
         phys_anchor = 0.02 * sum(
             (theta[k] - PHYS_INIT[k]) ** 2 for k in PHYS_INIT
         )
         nn_reg = nn_reg_weight * (out["dh_nn_mean"] ** 2)
-        return huber + phys_anchor + nn_reg
+        return sw * (huber + nn_reg) + phys_anchor
 
     @jax.jit
-    def _grad_none(params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, aa_wt, aa_mut, cm, tk, y_true):
+    def _grad_none(params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, aa_wt, aa_mut, cm, tk, y_true, sw):
         k_sub, k_jw, k_jm, k_drop = jax.random.split(step_key, 4)
         ew_f32 = ens_wt.astype(jnp.float32)
         em_f32 = ens_mut.astype(jnp.float32)
         n_frames = ew_f32.shape[0]
-        k_sub_n = max(2, n_frames - 1) if n_frames >= 4 else n_frames
+        k_sub_n = min(train_frames, n_frames)
         idx_w = jax.random.choice(k_sub, n_frames, shape=(k_sub_n,), replace=False)
         idx_m = jax.random.choice(k_drop, n_frames, shape=(k_sub_n,), replace=False)
 
@@ -1090,14 +1125,14 @@ def train_single_fold(
 
         return jax.value_and_grad(
             lambda p: _loss_core(
-                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true,
+                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true, sw,
                 s_wt_d, z_wt_d, s_mut_d, z_mut_d, s_wt_d, z_wt_d, s_mut_d, z_mut_d,
             )
         )(params)
 
     @jax.jit
     def _grad_joltz_sparse(
-        params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, cm, tk, y_true,
+        params, step_key, ens_wt, ens_mut, d_ref, phys_wt, phys_mut, w, pa, pb, res_mask, cm, tk, y_true, sw,
         s_wb, r_wb, c_wb, z_wb, s_mb, r_mb, c_mb, z_mb,
         s_wu, r_wu, c_wu, z_wu, s_mu, r_mu, c_mu, z_mu,
     ):
@@ -1105,7 +1140,7 @@ def train_single_fold(
         ew_f32 = ens_wt.astype(jnp.float32)
         em_f32 = ens_mut.astype(jnp.float32)
         n_frames = ew_f32.shape[0]
-        k_sub_n = max(2, n_frames - 1) if n_frames >= 4 else n_frames
+        k_sub_n = min(train_frames, n_frames)
         idx_w = jax.random.choice(k_sub, n_frames, shape=(k_sub_n,), replace=False)
         idx_m = jax.random.choice(k_drop, n_frames, shape=(k_sub_n,), replace=False)
 
@@ -1136,7 +1171,7 @@ def train_single_fold(
 
         return jax.value_and_grad(
             lambda p: _loss_core(
-                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true,
+                p, ew, em, d_ref, phys_wt, phys_mut, w, pa, pb, cm, tk, y_true, sw,
                 swb, zwb, smb, zmb, swu, zwu, smu, zmu,
             )
         )(params)
@@ -1179,7 +1214,8 @@ def train_single_fold(
                 pdbs.append(pid)
 
         m = skempi_metrics(jnp.asarray(preds), jnp.asarray(trues))
-        pc_r, pc_rho = _per_complex_stats(preds, trues, pdbs)
+        pc_r, pc_rho, _ = _per_complex_stats(preds, trues, pdbs, min_muts=3)
+        pc10_r, pc10_rho, _ = _per_complex_stats(preds, trues, pdbs, min_muts=10)
         return {
             "preds": preds,
             "trues": trues,
@@ -1189,10 +1225,14 @@ def train_single_fold(
             "rho": float(m["spearman_rho"]),
             "pc_r": pc_r,
             "pc_rho": pc_rho,
+            "pc10_r": pc10_r,
+            "pc10_rho": pc10_rho,
             "rmse": float(m["rmse"]),
             "mae": float(m["mae"]),
             "dh_phys": float(np.mean(np.abs(dh_p))),
             "dh_nn": float(np.mean(np.abs(dh_n))),
+            "mean_p": float(np.mean(preds)),
+            "mean_t": float(np.mean(trues)),
         }
 
     ckpt_path = os.path.join(weights_dir, f"{ckpt_prefix}_fold{fold_idx}.npz")
@@ -1202,7 +1242,8 @@ def train_single_fold(
 
     print(
         f"\n--- [{ckpt_prefix}] Fold {fold_idx} Training "
-        f"({len(train_items)} train / {len(val_items)} val | min_ep={min_epochs}, patience={patience}) ---",
+        f"({len(train_items)} train / {len(val_items)} val | lr={peak_lr:.0e}, wd={weight_decay:.0e}, "
+        f"nn_reg={nn_reg_weight:.0e}, huber={huber_delta:.1f}, min_ep={min_epochs}, patience={patience}) ---",
         flush=True,
     )
 
@@ -1217,14 +1258,17 @@ def train_single_fold(
             grad_acc = jax.tree_util.tree_map(jnp.zeros_like, model_params)
             b_loss = jnp.asarray(0.0, dtype=jnp.float32)
             for idx in batch_idx:
-                x = train_items[int(idx)]
+                i_int = int(idx)
+                x = train_items[i_int]
+                sw = jnp.asarray(sample_weights[i_int], dtype=jnp.float32)
                 k_train, k_step = jax.random.split(k_train)
                 if use_joltz:
                     sp = _pack_item_joltz_sparse(x, lru)
                     loss_val, grads = _grad_joltz_sparse(
                         model_params, k_step, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                         x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
-                        x["res_mask"], x["cm"], float(x["temp_k"]), jnp.asarray(x["ddg_exp"], jnp.float32),
+                        x["res_mask"], x["cm"], float(x["temp_k"]),
+                        jnp.asarray(x["ddg_exp"], jnp.float32), sw,
                         *sp,
                     )
                 else:
@@ -1232,7 +1276,7 @@ def train_single_fold(
                         model_params, k_step, x["ens_wt"], x["ens_mut"], x["d_ref_ca"],
                         x["phys_wt"], x["phys_mut"], x["weights"], x["pa_mask"], x["pb_mask"],
                         x["res_mask"], x["aa_wt"], x["aa_mut"], x["cm"], float(x["temp_k"]),
-                        jnp.asarray(x["ddg_exp"], jnp.float32),
+                        jnp.asarray(x["ddg_exp"], jnp.float32), sw,
                     )
                 grad_acc = jax.tree_util.tree_map(lambda a, g: a + g, grad_acc, grads)
                 b_loss = b_loss + loss_val
@@ -1253,17 +1297,14 @@ def train_single_fold(
         elif ep >= min_epochs:
             bad_epochs += 1
 
-        if ep == 1 or ep % 5 == 0 or improved or ep == epochs:
+        if ep == 1 or ep % 4 == 0 or improved or ep == epochs:
             theta_cur = _decode_theta(model_params["phys_raw"])
-            tr_str = ""
-            if ep == 1 or ep % 5 == 0 or ep == epochs:
-                tr_m = _run_eval(model_params, train_items[: min(len(train_items), 80)])
-                tr_str = f" | tr_r={tr_m['r']:+.3f} tr_RMSE={tr_m['rmse']:.3f}"
             mark = " *BEST*" if improved else ""
             print(
-                f"  [F{fold_idx} ep {ep:02d}/{epochs}] loss={np.mean(ep_losses):.3f}{tr_str} | "
-                f"VAL r={val_m['r']:+.3f} pc_r={val_m['pc_r']:+.3f} rho={val_m['rho']:+.3f} "
-                f"RMSE={val_m['rmse']:.3f} | |dH_p|={val_m['dh_phys']:.2f} |dH_nn|={val_m['dh_nn']:.2f} | "
+                f"  [F{fold_idx} ep {ep:02d}/{epochs}] loss={np.mean(ep_losses):.3f} | "
+                f"VAL r={val_m['r']:+.3f} pc10_r={val_m['pc10_r']:+.3f} rho={val_m['rho']:+.3f} "
+                f"RMSE={val_m['rmse']:.3f} | mean={val_m['mean_p']:+.2f}/{val_m['mean_t']:+.2f} | "
+                f"|dH_p|={val_m['dh_phys']:.2f} |dH_nn|={val_m['dh_nn']:.2f} | "
                 f"k=({float(theta_cur['k_clash']):.2f},{float(theta_cur['k_elec']):.2f},"
                 f"{float(theta_cur['k_hydro']):.2f},{float(theta_cur['k_hbond']):.2f}) "
                 f"({time.time() - t_ep:.1f}s){mark}",
@@ -1281,8 +1322,9 @@ def train_single_fold(
     final_val = _run_eval(reloaded, val_items)
     print(
         f"  [F{fold_idx} FINAL] Restored {ckpt_path} (ep {best_epoch}) -> "
-        f"VAL r={final_val['r']:+.3f}, pc_r={final_val['pc_r']:+.3f}, "
-        f"rho={final_val['rho']:+.3f}, RMSE={final_val['rmse']:.3f}",
+        f"VAL r={final_val['r']:+.3f}, pc10_r={final_val['pc10_r']:+.3f}, "
+        f"rho={final_val['rho']:+.3f}, RMSE={final_val['rmse']:.3f}, "
+        f"mean={final_val['mean_p']:+.2f}/{final_val['mean_t']:+.2f}",
         flush=True,
     )
 
@@ -1346,7 +1388,7 @@ def summarize_benchmark_pillars(
     oof_rows: List[Dict[str, object]],
     max_antisym: Optional[float] = None,
 ) -> Dict[str, float]:
-    """Prints Pillar 1 (Overall/Per-Complex), Pillar 2 (White-Box), and Pillar 3 (Black-Box Failure Zones)."""
+    """Prints Pillar 1 (Overall + Journal N>=10 Per-Complex), Pillar 2 (White-Box), and Pillar 3 (Failure Zones)."""
     preds = [float(r["ddg_pred"]) for r in oof_rows]
     trues = [float(r["ddg_exp"]) for r in oof_rows]
     pdbs = [str(r["pdb_id"]) for r in oof_rows]
@@ -1354,13 +1396,19 @@ def summarize_benchmark_pillars(
     dh_n = [abs(float(r["dh_nn"])) for r in oof_rows]
 
     ov = skempi_metrics(jnp.asarray(preds), jnp.asarray(trues))
-    pc_r, pc_rho = _per_complex_stats(preds, trues, pdbs)
+    pc3_r, pc3_rho, n3 = _per_complex_stats(preds, trues, pdbs, min_muts=3)
+    pc10_r, pc10_rho, n10 = _per_complex_stats(preds, trues, pdbs, min_muts=10)
 
     print(f"\n==================== {label} (N={len(oof_rows)} muts) ====================", flush=True)
     print(
         f"  [Pillar 1] Overall r={float(ov['pearson_r']):+.4f} | rho={float(ov['spearman_rho']):+.4f} | "
-        f"Per-Complex r={pc_r:+.4f} | Per-Complex rho={pc_rho:+.4f} | "
-        f"RMSE={float(ov['rmse']):.3f} | MAE={float(ov['mae']):.3f}",
+        f"RMSE={float(ov['rmse']):.3f} | MAE={float(ov['mae']):.3f} | "
+        f"mean_p={np.mean(preds):+.2f} vs mean_t={np.mean(trues):+.2f}",
+        flush=True,
+    )
+    print(
+        f"  [Pillar 1] Per-Complex(N>=10, {n10:2d} PDBs): r={pc10_r:+.4f}, rho={pc10_rho:+.4f} | "
+        f"Per-Complex(N>=3, {n3:3d} PDBs): r={pc3_r:+.4f}, rho={pc3_rho:+.4f}",
         flush=True,
     )
     antisym_s = f" | BAR max|fwd+rev|={max_antisym:.2e}" if max_antisym is not None else ""
@@ -1369,7 +1417,6 @@ def summarize_benchmark_pillars(
         flush=True,
     )
 
-    # Pillar 3a: Single vs Multi-Point Epistasis
     for tag, cond in [
         ("Single (n=1)", lambda r: int(r["n_muts"]) == 1),
         ("Multi  (n>=2)", lambda r: int(r["n_muts"]) >= 2),
@@ -1386,7 +1433,6 @@ def summarize_benchmark_pillars(
                 flush=True,
             )
 
-    # Pillar 3b: Stabilizing (< -0.5) vs Destabilizing (> +0.5)
     for tag, cond, sign_fn in [
         ("Stabilizing (<-0.5)", lambda r: float(r["ddg_exp"]) < -0.5, lambda p: p < 0.0),
         ("Destabiliz. (>+0.5)", lambda r: float(r["ddg_exp"]) > 0.5, lambda p: p > 0.0),
@@ -1395,16 +1441,16 @@ def summarize_benchmark_pillars(
         if len(sub) >= 3:
             sp = np.asarray([float(r["ddg_pred"]) for r in sub])
             st = np.asarray([float(r["ddg_exp"]) for r in sub])
+            r_sub = float(np.corrcoef(sp, st)[0, 1]) if (np.std(sp) > 1e-6 and np.std(st) > 1e-6) else float("nan")
             rmse = float(np.sqrt(np.mean((sp - st) ** 2)))
             mae = float(np.mean(np.abs(sp - st)))
             sign_acc = float(np.mean([sign_fn(p) for p in sp])) * 100.0
             print(
-                f"  [Pillar 3] {tag:19s} (N={len(sub):4d}): RMSE={rmse:.3f} | MAE={mae:.3f} | "
-                f"SignAcc={sign_acc:.1f}%",
+                f"  [Pillar 3] {tag:19s} (N={len(sub):4d}): r={r_sub:+.3f} | RMSE={rmse:.3f} | "
+                f"MAE={mae:.3f} | SignAcc={sign_acc:.1f}%",
                 flush=True,
             )
 
-    # Pillar 3c: Per-Family Breakdown (AB/AG, TCR/pMHC, Pr/PI, Other)
     by_fam: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     for r in oof_rows:
         by_fam[str(r["family"])].append(r)
@@ -1424,8 +1470,8 @@ def summarize_benchmark_pillars(
     return {
         "r": float(ov["pearson_r"]),
         "rho": float(ov["spearman_rho"]),
-        "pc_r": pc_r,
-        "pc_rho": pc_rho,
+        "pc_r": pc10_r if not np.isnan(pc10_r) else pc3_r,
+        "pc_rho": pc10_rho if not np.isnan(pc10_rho) else pc3_rho,
         "rmse": float(ov["rmse"]),
         "mae": float(ov["mae"]),
     }
@@ -1450,7 +1496,7 @@ def _run_cv_suite(
     if sparse_lru is not None:
         print(
             f"[CACHE] Sparse Joltz-1 RAM LRU budget = {sparse_lru.max_bytes / (1024 ** 3):.1f} GB "
-            f"(bit-exact GPU scatter active)",
+            f"(bit-exact GPU/TPU scatter + length buckets active)",
             flush=True,
         )
 
@@ -1505,18 +1551,20 @@ def run_skempi_cv(
     weights_dir: str = "/content/oncovac_weights",
     recycling_steps: int = 1,
     use_msa: bool = False,
-    patience: int = 8,
-    min_epochs: int = 6,
+    patience: int = 7,
+    min_epochs: int = 5,
     drive_backup_dir: str = "",
+    drive_weights_subdir: str = "",
     resume_folds: bool = False,
 ) -> None:
     presets = {
         "mini": dict(max_n=384, max_complexes=12, max_per_pdb=8, epochs=20, batch_size=8),
-        "mid":  dict(max_n=448, max_complexes=45, max_per_pdb=16, epochs=25, batch_size=12),
-        "full": dict(max_n=512, max_complexes=400, max_per_pdb=100, epochs=30, batch_size=16),
+        "mid":  dict(max_n=448, max_complexes=45, max_per_pdb=16, epochs=24, batch_size=12),
+        "full": dict(max_n=512, max_complexes=400, max_per_pdb=100, epochs=24, batch_size=16),
     }
     cfg = presets[mode]
-    drive_weights_dir = os.path.join(drive_backup_dir, f"weights_{mode}") if drive_backup_dir else ""
+    sub_name = drive_weights_subdir if drive_weights_subdir else f"weights_{mode}"
+    drive_weights_dir = os.path.join(drive_backup_dir, sub_name) if drive_backup_dir else ""
     print(
         f"=== OncoVac-Adenine Gen 1 | 3-Fold Family-Disjoint SKEMPI 2.0 "
         f"(mode={mode.upper()}, prior={prior}, msa={use_msa}, rec={recycling_steps}, "
@@ -1538,7 +1586,8 @@ def run_skempi_cv(
         _sync_dir_incremental(os.path.join(cache_dir, "pdbs"), dst_pdbs, _init_synced_index(dst_pdbs))
 
     items = prepare_cached_ensembles(
-        records, jax.random.PRNGKey(42), cache_dir=cache_dir, drive_backup_dir=drive_backup_dir
+        records, jax.random.PRNGKey(42), cache_dir=cache_dir,
+        cache_max_n=cfg["max_n"], drive_backup_dir=drive_backup_dir,
     )
 
     if prior in ("joltz", "both"):
@@ -1599,7 +1648,7 @@ def run_skempi_cv(
 
     print("\n================================================================================", flush=True)
     print(f"SIDE-BY-SIDE 3-FOLD FAMILY-DISJOINT SUMMARY ({mode.upper()}, msa={use_msa})", flush=True)
-    print(f"{'Model':34s} | {'r':>7s} | {'pc_r':>7s} | {'rho':>7s} | {'RMSE':>6s} | {'MAE':>6s}", flush=True)
+    print(f"{'Model':34s} | {'r':>7s} | {'pc10_r':>7s} | {'rho':>7s} | {'RMSE':>6s} | {'MAE':>6s}", flush=True)
     print("-" * 80, flush=True)
     for name, st in summary_rows:
         print(
@@ -1619,9 +1668,10 @@ if __name__ == "__main__":
     parser.add_argument("--cache-dir", default="/content/oncovac_cache")
     parser.add_argument("--boltz-cache-dir", default="/content/boltz_cache")
     parser.add_argument("--weights-dir", default="/content/oncovac_weights")
-    parser.add_argument("--patience", type=int, default=8)
-    parser.add_argument("--min-epochs", type=int, default=6)
+    parser.add_argument("--patience", type=int, default=7)
+    parser.add_argument("--min-epochs", type=int, default=5)
     parser.add_argument("--drive-backup-dir", default="", help="Optional Drive dir for periodic cache/fold backups")
+    parser.add_argument("--drive-weights-subdir", default="", help="Optional subdir under drive-backup-dir for weights")
     parser.add_argument("--resume-folds", action="store_true", help="Safely skip verified finished folds on restart")
     args = parser.parse_args()
     run_skempi_cv(
@@ -1635,5 +1685,6 @@ if __name__ == "__main__":
         patience=args.patience,
         min_epochs=args.min_epochs,
         drive_backup_dir=args.drive_backup_dir,
+        drive_weights_subdir=args.drive_weights_subdir,
         resume_folds=args.resume_folds,
     )
