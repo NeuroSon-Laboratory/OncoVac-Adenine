@@ -16,11 +16,7 @@ def _solve_bar_root(
     kbt: jnp.ndarray,
     num_iters: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Solves the exact minimum-variance Bennett (1976) Acceptance Ratio equation:
-        sum_{i=1}^{N_F} sigmoid(-beta * (dh_wt_i - c*)) - sum_{j=1}^{N_R} sigmoid(-beta * (-dh_mut_j + c*)) = 0
-    Exact for arbitrary sample sizes N_F, N_R via ddG = c* - k_B*T * ln(N_R / N_F).
-    """
+    """Solves exact minimum-variance Bennett (1976) Acceptance Ratio equation for arbitrary N_F, N_R."""
     kbt_f32 = jnp.asarray(kbt, dtype=jnp.float32)
     beta = 1.0 / kbt_f32
     n_f = jnp.asarray(dh_wt.shape[0], dtype=jnp.float32)
@@ -54,20 +50,12 @@ def bar_ddg(
     kbt: float = KBT_PHYS,
     num_iters: int = 60,
 ) -> jnp.ndarray:
-    """
-    Exact, thermodynamically antisymmetric, implicitly differentiable BAR estimator.
-    JIT-traceable w.r.t. dynamic per-mutation kbt; exact antisymmetry for ANY N_F, N_R.
-    """
+    """Exact, thermodynamically antisymmetric, implicitly differentiable BAR estimator."""
     ddg, _ = _solve_bar_root(dh_wt, dh_mut, kbt, num_iters)
     return ddg
 
 
-def _bar_fwd(
-    dh_wt: jnp.ndarray,
-    dh_mut: jnp.ndarray,
-    kbt: jnp.ndarray,
-    num_iters: int,
-):
+def _bar_fwd(dh_wt: jnp.ndarray, dh_mut: jnp.ndarray, kbt: jnp.ndarray, num_iters: int):
     kbt_f32 = jnp.asarray(kbt, dtype=jnp.float32)
     ddg, c_star = _solve_bar_root(dh_wt, dh_mut, kbt_f32, num_iters)
     return ddg, (dh_wt, dh_mut, kbt_f32, c_star)
@@ -100,10 +88,7 @@ def bar_overlap_diagnostic(
     ddg: jnp.ndarray,
     kbt: float = KBT_PHYS,
 ) -> Dict[str, jnp.ndarray]:
-    """
-    Computes normalized phase-space overlap in [0, 1] and Delta-method sandwich std_err
-    (exact 0 for identical states, always non-negative, valid for arbitrary N_F != N_R).
-    """
+    """Computes normalized phase-space overlap in [0, 1] and Delta-method sandwich std_err."""
     kbt_f32 = jnp.asarray(kbt, dtype=jnp.float32)
     beta = 1.0 / kbt_f32
     n_f = jnp.asarray(dh_wt.shape[0], dtype=jnp.float32)
@@ -144,10 +129,7 @@ def evaluate_dh_batch(
     chain_mask: Optional[jnp.ndarray] = None,
     use_adaptive_dielectric: bool = True,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    """
-    Vectorized Delta H(X) = H_Mut(X) - H_WT(X) over an (M, MAX_N, 3, 3) equilibrium ensemble
-    (zero Metadynamics hills: k_rep = 0.0), returning white-box physical vs. neural decomposition.
-    """
+    """Vectorized Delta H(X) = H_Mut(X) - H_WT(X) over an (M, MAX_N, 3, 3) equilibrium ensemble."""
     max_n = backbone_ens.shape[1]
     empty_D = jnp.zeros((1, max_n, max_n), dtype=jnp.float32)
     empty_m = jnp.zeros((1,), dtype=jnp.float32)
@@ -199,16 +181,24 @@ def binding_ddg_bar(
     unbound_a_mut_ens: Optional[jnp.ndarray] = None,
     unbound_b_wt_ens: Optional[jnp.ndarray] = None,
     unbound_b_mut_ens: Optional[jnp.ndarray] = None,
+    du_chem_c_wt: Optional[jnp.ndarray] = None,
+    du_chem_c_mut: Optional[jnp.ndarray] = None,
+    du_chem_a_wt: Optional[jnp.ndarray] = None,
+    du_chem_a_mut: Optional[jnp.ndarray] = None,
+    du_chem_b_wt: Optional[jnp.ndarray] = None,
+    du_chem_b_mut: Optional[jnp.ndarray] = None,
     temp_k: float = TEMP_PHYS,
     use_adaptive_dielectric: bool = True,
 ) -> Dict[str, jnp.ndarray]:
     """
     Exact SKEMPI 2.0 / Protein-Drug Bound-Unbound Thermodynamic Cycle via BAR:
+        H_alpha(X) = H_phys(virtual_sc) + k_chem * U_chem(X; alpha) + U_NN(X; alpha, Joltz-1)
         ddG_bind = dG_complex(WT -> Mut) - [dG_unbound_A(WT -> Mut) + dG_unbound_B(WT -> Mut)]
-    Reports true bound-minus-unbound white-box attribution (`dh_phys_mean`, `dh_nn_mean`).
+    Reports 3-way white-box attribution (`dh_phys_mean`, `dh_chem_mean`, `dh_nn_mean`).
     """
     kbt = R_GAS * jnp.asarray(temp_k, dtype=jnp.float32)
     complex_mask = jnp.clip(partner_a_mask + partner_b_mask, 0.0, 1.0)
+    k_chem = jnp.asarray(theta.get("k_chem", 0.0), dtype=jnp.float32)
 
     s_wt_u = single_wt if single_wt_unbound is None else single_wt_unbound
     z_wt_u = pair_wt if pair_wt_unbound is None else pair_wt_unbound
@@ -226,7 +216,11 @@ def binding_ddg_bar(
         single_wt=single_wt, pair_wt=pair_wt, single_mut=single_mut, pair_mut=pair_mut,
         nn_params=nn_params, chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
     )
-    ddg_complex = bar_ddg(dh_c_wt, dh_c_mut, kbt)
+    dc_c_wt = jnp.zeros_like(dh_c_wt) if du_chem_c_wt is None else k_chem * du_chem_c_wt.astype(jnp.float32)
+    dc_c_mut = jnp.zeros_like(dh_c_mut) if du_chem_c_mut is None else k_chem * du_chem_c_mut.astype(jnp.float32)
+    dh_c_wt_tot = dh_c_wt + dc_c_wt
+    dh_c_mut_tot = dh_c_mut + dc_c_mut
+    ddg_complex = bar_ddg(dh_c_wt_tot, dh_c_mut_tot, kbt)
 
     # 2. Unbound Partner A leg
     ens_a_wt = complex_wt_ens if unbound_a_wt_ens is None else unbound_a_wt_ens
@@ -241,7 +235,9 @@ def binding_ddg_bar(
         single_wt=s_wt_u, pair_wt=z_wt_u, single_mut=s_mut_u, pair_mut=z_mut_u,
         nn_params=nn_params, chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
     )
-    ddg_unbound_a = bar_ddg(dh_a_wt, dh_a_mut, kbt)
+    dc_a_wt = jnp.zeros_like(dh_a_wt) if du_chem_a_wt is None else k_chem * du_chem_a_wt.astype(jnp.float32)
+    dc_a_mut = jnp.zeros_like(dh_a_mut) if du_chem_a_mut is None else k_chem * du_chem_a_mut.astype(jnp.float32)
+    ddg_unbound_a = bar_ddg(dh_a_wt + dc_a_wt, dh_a_mut + dc_a_mut, kbt)
 
     # 3. Unbound Partner B leg
     ens_b_wt = complex_wt_ens if unbound_b_wt_ens is None else unbound_b_wt_ens
@@ -256,17 +252,24 @@ def binding_ddg_bar(
         single_wt=s_wt_u, pair_wt=z_wt_u, single_mut=s_mut_u, pair_mut=z_mut_u,
         nn_params=nn_params, chain_mask=chain_mask, use_adaptive_dielectric=use_adaptive_dielectric,
     )
-    ddg_unbound_b = bar_ddg(dh_b_wt, dh_b_mut, kbt)
+    dc_b_wt = jnp.zeros_like(dh_b_wt) if du_chem_b_wt is None else k_chem * du_chem_b_wt.astype(jnp.float32)
+    dc_b_mut = jnp.zeros_like(dh_b_mut) if du_chem_b_mut is None else k_chem * du_chem_b_mut.astype(jnp.float32)
+    ddg_unbound_b = bar_ddg(dh_b_wt + dc_b_wt, dh_b_mut + dc_b_mut, kbt)
 
     ddg_unbound = ddg_unbound_a + ddg_unbound_b
     ddg_bind = ddg_complex - ddg_unbound
-    diag = bar_overlap_diagnostic(dh_c_wt, dh_c_mut, ddg_complex, kbt)
+    diag = bar_overlap_diagnostic(dh_c_wt_tot, dh_c_mut_tot, ddg_complex, kbt)
 
-    # True bound-minus-unbound white-box attribution (intra-chain self-energies cancel cleanly)
+    # 3-way true bound-minus-unbound white-box attribution
     dh_phys_c = 0.5 * (jnp.mean(parts_c_wt["dh_phys"]) + jnp.mean(parts_c_mut["dh_phys"]))
     dh_phys_u = 0.5 * (
         jnp.mean(parts_a_wt["dh_phys"]) + jnp.mean(parts_a_mut["dh_phys"])
         + jnp.mean(parts_b_wt["dh_phys"]) + jnp.mean(parts_b_mut["dh_phys"])
+    )
+    dh_chem_c = 0.5 * (jnp.mean(dc_c_wt) + jnp.mean(dc_c_mut))
+    dh_chem_u = 0.5 * (
+        jnp.mean(dc_a_wt) + jnp.mean(dc_a_mut)
+        + jnp.mean(dc_b_wt) + jnp.mean(dc_b_mut)
     )
     dh_nn_c = 0.5 * (jnp.mean(parts_c_wt["dh_nn"]) + jnp.mean(parts_c_mut["dh_nn"]))
     dh_nn_u = 0.5 * (
@@ -283,6 +286,7 @@ def binding_ddg_bar(
         "overlap_score": diag["overlap_score"],
         "std_err": diag["std_err"],
         "dh_phys_mean": dh_phys_c - dh_phys_u,
+        "dh_chem_mean": dh_chem_c - dh_chem_u,
         "dh_nn_mean": dh_nn_c - dh_nn_u,
     }
 
