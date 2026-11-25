@@ -41,7 +41,7 @@ from cancerfold.af2_core.boltz_chem import (
 from cancerfold.af2_core.joltz_prior import prepare_wt_mut_priors
 from cancerfold.af2_core.stochastic_folding import init_folding_params
 from cancerfold.analyzer.thermo import binding_ddg_bar, skempi_metrics
-from cancerfold.physics.sde import sample_ensemble
+from cancerfold.physics.sde import DEFAULT_BURN_IN, DEFAULT_DT, DEFAULT_GAMMA, sample_ensemble
 
 # Stage-1 analytical force-field initial scales (strictly positive via softplus)
 PHYS_INIT_V3 = {
@@ -220,15 +220,16 @@ def prepare_virtual_sc_ensembles_300k(
     cache_max_n: int = 512,
     num_replicas: int = 2,
     num_steps: int = 100,
-    burn_in: int = 50,
+    burn_in: int = DEFAULT_BURN_IN,
     stride: int = 16,
-    dt: float = 0.008,
-    gamma: float = 6.0,
+    dt: float = DEFAULT_DT,
+    gamma: float = DEFAULT_GAMMA,
     drive_backup_dir: str = "",
 ) -> List[Dict[str, object]]:
     """
-    Generates or reloads physiologically equilibrated (~300-310 K) BAOAB ensembles under virtual_sc:
-    fixed dt=0.008 & gamma=6.0 satisfy symplectic stability (omega_max * dt < 0.15) and exact detailed balance.
+    Generates or reloads physiologically equilibrated (~300-310 K) BAOAB ensembles under virtual_sc.
+    dt, gamma, and burn_in are inherited directly from cancerfold.physics.sde (single source of truth
+    in the physics engine); this script only sets the SKEMPI sampling budget (num_replicas, num_steps, stride).
     """
     sde_subdir = f"baoab_sc300k_n{cache_max_n}_r{num_replicas}_s{num_steps}"
     sde_dir = os.path.join(cache_dir, sde_subdir)
@@ -1111,7 +1112,7 @@ def run_skempi_v3(
     print("-" * 80, flush=True)
     for name, st in summary_rows:
         print(
-            f"{name:34s} | {st['r']:+7.4f} | {st['pc_r']:+7.4f} | {st['rho']:+7.4f} | "
+            f"{name:34s} | {st['r']:+7.4f} | {st['pc10_r']:+7.4f} | {st['rho']:+7.4f} | "
             f"{st['rmse']:6.3f} | {st['mae']:6.3f}",
             flush=True,
         )
