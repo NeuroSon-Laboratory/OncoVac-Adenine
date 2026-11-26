@@ -223,7 +223,7 @@ def run_single_case(
     max_n = _select_bucket(n_valid)
 
     mut_info = mut_parser.parse(mut_code, res_map=struct["res_map"])
-    mut_idx = int(mut_info["pos"])
+    mut_idx = int(mut_info["idx_0based"])
     actual_wt = seq_wt[mut_idx]
     if actual_wt != mut_info["wt"]:
         raise ValueError(
@@ -231,7 +231,7 @@ def run_single_case(
             f"PDB has '{actual_wt}', expected '{mut_info['wt']}'."
         )
 
-    seq_mut = mut_parser.apply_mutations(seq_wt, [mut_info])
+    seq_mut = mut_parser.point(seq_wt, mut_code, res_map=struct["res_map"])
     bb_pad, cm_pad, res_mask = pad_structure(struct["backbone"], struct["chain_mask"], max_n)
     pad_len = max_n - n_valid
 
@@ -239,22 +239,23 @@ def run_single_case(
     enc_mut = mut_parser.encode(seq_mut)
     phys_wt = jnp.pad(enc_wt["phys_state"], ((0, pad_len), (0, 0)), constant_values=0.0)
     phys_mut = jnp.pad(enc_mut["phys_state"], ((0, pad_len), (0, 0)), constant_values=0.0)
-    aa_wt = jnp.pad(enc_wt["aa_idx"], (0, pad_len), constant_values=0)
-    aa_mut = jnp.pad(enc_mut["aa_idx"], (0, pad_len), constant_values=0)
+    aa_wt = jnp.pad(enc_wt["idx"], (0, pad_len), constant_values=0)
+    aa_mut = jnp.pad(enc_mut["idx"], (0, pad_len), constant_values=0)
 
     d_ref_ca = jnp.linalg.norm(bb_pad[:, 1, None, :] - bb_pad[None, :, 1, :], axis=-1)
     mut_mask = jnp.zeros((max_n,), dtype=jnp.float32).at[mut_idx].set(1.0)
     weights = multi_pocket_mask(bb_pad[:, 1, :], mut_mask, residue_mask=res_mask, sigma=8.0)
 
     # Map functional region residue numbers -> 0-based indices
+    # struct["res_ids"] is List[Tuple[str, int]] of (chain_id, resseq)
     lo_res, hi_res = case["functional_res_range"]
     region_indices: List[int] = []
     for idx_i, rid in enumerate(struct["res_ids"]):
         try:
-            rnum = int(str(rid).strip())
+            rnum = int(rid[1]) if isinstance(rid, (tuple, list)) else int(str(rid).strip())
             if lo_res <= rnum <= hi_res:
                 region_indices.append(idx_i)
-        except ValueError:
+        except (ValueError, TypeError, IndexError):
             pass
 
     # 1. Physiological 310 K BAOAB + Well-Tempered Metadynamics sampling
@@ -334,7 +335,8 @@ def run_single_case(
         "ddg_phys_kcal": round(ddg_phys, 4),
         "ddg_chem_kcal": round(ddg_chem, 4),
         "bar_antisym_err": float(f"{bar_antisym_err:.2e}"),
-        "bar_overlap": round(float(overlap_diag.get("overlap", jnp.nan)), 4),
+        "bar_overlap": round(float(overlap_diag["overlap_score"]), 4),
+        "bar_std_err_kcal": round(float(overlap_diag["std_err"]), 4),
         "functional_region": case["functional_region_name"],
         **{k: round(v, 4) for k, v in struct_metrics.items()},
         "elapsed_s": round(elapsed, 2),
