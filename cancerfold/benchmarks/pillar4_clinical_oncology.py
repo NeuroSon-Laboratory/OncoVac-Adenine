@@ -14,7 +14,7 @@ on three clinically critical oncogenic mutations:
 2. KRAS (GTPase, PDB 4OBE, chain A): G12C
    - Landmark "undruggable" oncogene opening the Switch-II (res 58-76) cryptic
      allosteric pocket (Ostrem et al., Nature 2013).
-3. TP53 / p53 (DNA-binding domain, PDB 2J1X, chain A): Y220C
+3. TP53 / p53 (DNA-binding domain, PDB 2OCJ, chain A): Y220C
    - Canonical destabilizing cancer mutation (exp. ddG_fold ~ +4.0 kcal/mol)
      linked to apoptosis resistance in luminal breast cancer (Dinge, H. L., 2026,
      Sp Thesis, Universitas Hasanuddin, Sec. 2.2.7 & Table 1; Belachew & Sewasew, 2021)
@@ -108,7 +108,7 @@ CLINICAL_CASES: List[Dict[str, object]] = [
     {
         "case_id": "TP53_Y220C",
         "gene": "TP53 / p53 (DBD)",
-        "pdb_id": "2J1X",
+        "pdb_id": "2OCJ",
         "chain": "A",
         "mut_code": "YA220C",
         "reference": "Dinge, H. L. (2026), Sp Thesis, Univ. Hasanuddin (Sec. 2.2.7, Table 1); Belachew & Sewasew, 2021; Joerger et al., PNAS 2006",
