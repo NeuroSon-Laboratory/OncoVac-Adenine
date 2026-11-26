@@ -6,13 +6,19 @@ on three clinically critical oncogenic mutations:
 
 1. ESR1 (ER-alpha LBD, PDB 1ERE, chain A): Y537S & D538G
    - Luminal breast cancer endocrine-therapy resistance (Tamoxifen / AI) via
-     constitutive Helix-12 (res 536-548) activation (Toy et al., Nature Genetics 2013).
+     constitutive Helix-12 (res 536-548) activation.
+   - Clinical motivation & references: Dinge, H. L. (2026), Sp Thesis,
+     Universitas Hasanuddin (Sec. 2.2.3 & Table 1; PERABOI 2020 / ESMO 2024 / NCCN 2025);
+     Robinson et al., Nature Genetics 2013; Leary et al., 2016;
+     Belachew & Sewasew, Frontiers in Endocrinology 2021.
 2. KRAS (GTPase, PDB 4OBE, chain A): G12C
    - Landmark "undruggable" oncogene opening the Switch-II (res 58-76) cryptic
      allosteric pocket (Ostrem et al., Nature 2013).
 3. TP53 / p53 (DNA-binding domain, PDB 2J1X, chain A): Y220C
    - Canonical destabilizing cancer mutation (exp. ddG_fold ~ +4.0 kcal/mol)
-     creating a druggable crevice around res 145-157 & 218-232 (Joerger et al., PNAS 2006).
+     linked to apoptosis resistance in luminal breast cancer (Dinge, H. L., 2026,
+     Sp Thesis, Universitas Hasanuddin, Sec. 2.2.7 & Table 1; Belachew & Sewasew, 2021)
+     and opening a druggable crevice around res 145-157 & 218-232 (Joerger et al., PNAS 2006).
 
 Runs 100% Pure-JAX (Zero-Shot 310K virtual_sc + U_chem), verifies Exact BAR
 antisymmetry |fwd + rev| < 1e-5 on every mutation, computes regional RMSF &
@@ -72,7 +78,7 @@ CLINICAL_CASES: List[Dict[str, object]] = [
         "pdb_id": "1ERE",
         "chain": "A",
         "mut_code": "YA537S",
-        "reference": "Toy et al., Nat Genet 2013 (Luminal Breast Cancer)",
+        "reference": "Dinge, H. L. (2026), Sp Thesis, Univ. Hasanuddin (Sec. 2.2.3, Table 1); Robinson et al., Nat Genet 2013; Belachew & Sewasew, 2021",
         "functional_region_name": "Helix-12 (536-548)",
         "functional_res_range": (536, 548),
         "exp_note": "Constitutive Helix-12 lock; endocrine resistance (Tamoxifen/AI)",
@@ -83,7 +89,7 @@ CLINICAL_CASES: List[Dict[str, object]] = [
         "pdb_id": "1ERE",
         "chain": "A",
         "mut_code": "DA538G",
-        "reference": "Toy et al., Nat Genet 2013 (Luminal Breast Cancer)",
+        "reference": "Dinge, H. L. (2026), Sp Thesis, Univ. Hasanuddin (Sec. 2.2.3, Table 1); Robinson et al., Nat Genet 2013; Belachew & Sewasew, 2021",
         "functional_region_name": "Helix-12 (536-548)",
         "functional_res_range": (536, 548),
         "exp_note": "Helix-12 agonist-like stabilization; endocrine resistance",
@@ -105,7 +111,7 @@ CLINICAL_CASES: List[Dict[str, object]] = [
         "pdb_id": "2J1X",
         "chain": "A",
         "mut_code": "YA220C",
-        "reference": "Joerger et al., PNAS 2006 (exp ddG_fold ~ +4.0 kcal/mol)",
+        "reference": "Dinge, H. L. (2026), Sp Thesis, Univ. Hasanuddin (Sec. 2.2.7, Table 1); Belachew & Sewasew, 2021; Joerger et al., PNAS 2006",
         "functional_region_name": "Y220C Crevice (145-157,218-232)",
         "functional_res_range": (218, 232),
         "exp_note": "Severe core destabilization (+4.0 kcal/mol); opens druggable pocket",
@@ -295,14 +301,25 @@ def run_single_case(
     )
 
     # 3. Pure-JAX Evolutionary Chemical Potential Work (dH_chem)
+    # Chunked (4 frames/batch) + JIT so peak HBM stays < 1 GB on TPU v5e / T4 / CPU
     ranks_k = jnp.asarray(make_fixed_decoding_ranks(np.asarray(res_mask), num_orders=4))
     kbt = K_B_KCAL * temp_k
-    dh_chem_wt = du_chem_ensemble(
-        chem_params, ens_wt, aa_wt, aa_mut, res_mask, cm_pad, ranks_k, kbt=kbt,
-    )
-    dh_chem_mut = du_chem_ensemble(
-        chem_params, ens_mut, aa_wt, aa_mut, res_mask, cm_pad, ranks_k, kbt=kbt,
-    )
+
+    @jax.jit
+    def _du_chem_batch(bb_chunk: jnp.ndarray) -> jnp.ndarray:
+        return du_chem_ensemble(
+            chem_params, bb_chunk, aa_wt, aa_mut, res_mask, cm_pad, ranks_k, kbt=kbt,
+        )
+
+    def _du_chem_chunked(ens: jnp.ndarray, chunk_size: int = 4) -> jnp.ndarray:
+        n_frames = ens.shape[0]
+        parts = []
+        for s in range(0, n_frames, chunk_size):
+            parts.append(jax.device_get(_du_chem_batch(ens[s : s + chunk_size])))
+        return jnp.asarray(np.concatenate(parts, axis=0), dtype=jnp.float32)
+
+    dh_chem_wt = _du_chem_chunked(ens_wt, chunk_size=4)
+    dh_chem_mut = _du_chem_chunked(ens_mut, chunk_size=4)
 
     # 4. Exact BAR Free Energy + Antisymmetry Check + Overlap Diagnostic
     dh_tot_wt = dh_phys_wt + dh_chem_wt
