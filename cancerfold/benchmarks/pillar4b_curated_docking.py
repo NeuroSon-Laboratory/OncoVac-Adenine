@@ -25,11 +25,64 @@ import argparse
 import csv
 import json
 import os
+import re
+import shutil
+import stat
+import subprocess
 import time
 import urllib.request
 from typing import Dict, List, Tuple
 
 import numpy as np
+
+VINA_LINUX_URL = "https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_linux_x86_64"
+
+
+def ensure_vina_binary(work_dir: str) -> str:
+    """Finds `vina` on PATH or downloads official Scripps AutoDock Vina 1.2.5 static binary."""
+    existing = shutil.which("vina")
+    if existing:
+        return existing
+    local_bin = os.path.join(work_dir, "vina_1.2.5_linux_x86_64")
+    if not os.path.exists(local_bin) or os.path.getsize(local_bin) < 1_000_000:
+        print(f"[FETCH] Downloading official AutoDock Vina 1.2.5 binary (4.1 MB)...")
+        urllib.request.urlretrieve(VINA_LINUX_URL, local_bin)
+        os.chmod(local_bin, os.stat(local_bin).st_mode | stat.S_IEXEC)
+    return local_bin
+
+
+def run_vina_cli(
+    vina_bin: str,
+    rec_pdbqt: str,
+    lig_pdbqt_path: str,
+    center: List[float],
+    box: List[float],
+    exhaustiveness: int,
+    seed: int,
+    out_pdbqt: str,
+) -> float:
+    """Runs official AutoDock Vina 1.2.5 CLI and returns best-mode affinity [kcal/mol]."""
+    cmd = [
+        vina_bin,
+        "--receptor", rec_pdbqt,
+        "--ligand", lig_pdbqt_path,
+        "--center_x", str(center[0]),
+        "--center_y", str(center[1]),
+        "--center_z", str(center[2]),
+        "--size_x", str(box[0]),
+        "--size_y", str(box[1]),
+        "--size_z", str(box[2]),
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes", "5",
+        "--seed", str(seed),
+        "--out", out_pdbqt,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    for line in res.stdout.splitlines():
+        m = re.match(r"^\s*1\s+([-+]?\d+\.\d+)\s+", line)
+        if m:
+            return float(m.group(1))
+    raise RuntimeError(f"Could not parse Vina affinity from output:\n{res.stdout}\n{res.stderr}")
 
 # Exact PubChem-verified canonical SMILES (counterions stripped)
 DECOYS: List[Dict[str, str]] = [
@@ -250,8 +303,6 @@ def plot_pillar4b_figure(all_rows: List[Dict[str, object]], summary: List[Dict[s
 
 
 def main() -> None:
-    from vina import Vina
-
     ap = argparse.ArgumentParser(description="OncoVac Adenine Pillar 4B Curated Clinical Drug Ranking")
     ap.add_argument("--out-dir", type=str, default="/content/pillar4b_docking")
     ap.add_argument("--exhaustiveness", type=int, default=8)
@@ -261,11 +312,12 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     work_dir = os.path.join(args.out_dir, "work")
     os.makedirs(work_dir, exist_ok=True)
+    vina_bin = ensure_vina_binary(work_dir)
 
     all_rows: List[Dict[str, object]] = []
     summary_rows: List[Dict[str, object]] = []
 
-    print("=== OncoVac Adenine Gen 1 — Pillar 4B: Curated Clinical Drug Ranking (AutoDock Vina) ===")
+    print(f"=== OncoVac Adenine Gen 1 — Pillar 4B: Curated Clinical Drug Ranking (AutoDock Vina 1.2.5) ===")
     for tgt in TARGETS:
         t0 = time.time()
         tid = str(tgt["target_id"])
@@ -275,17 +327,18 @@ def main() -> None:
         box = tgt["box_size"]
         print(f"\n[TARGET] {tid} ({tgt['pdb_id']}:{tgt['chain']}) | pocket={tgt['lig_resname']} center={center}")
 
-        v = Vina(sf_name="vina", seed=args.seed, verbosity=0)
-        v.set_receptor(rec_pdbqt)
-        v.compute_vina_maps(center=center, box_size=box)
-
         ligands = list(tgt["actives"]) + DECOYS
         scores, flags = [], []
         for lig in ligands:
-            lig_pdbqt = smiles_to_pdbqt(lig["smiles"])
-            v.set_ligand_from_string(lig_pdbqt)
-            v.dock(exhaustiveness=args.exhaustiveness, n_poses=5)
-            aff = float(v.energies(n_poses=1)[0][0])
+            safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", lig["name"])
+            lig_pdbqt_path = os.path.join(work_dir, f"{tid}_{safe_name}.pdbqt")
+            out_pdbqt_path = os.path.join(work_dir, f"{tid}_{safe_name}_out.pdbqt")
+            with open(lig_pdbqt_path, "w", encoding="utf-8") as lf:
+                lf.write(smiles_to_pdbqt(lig["smiles"]))
+            aff = run_vina_cli(
+                vina_bin, rec_pdbqt, lig_pdbqt_path, center, box,
+                args.exhaustiveness, args.seed, out_pdbqt_path,
+            )
             scores.append(aff)
             flags.append(lig["role"] == "Active")
             all_rows.append({
